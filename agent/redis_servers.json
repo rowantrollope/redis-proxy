@@ -1,0 +1,8 @@
+{
+  "68FA1E72-AA58-4845-B5E1-8F82DBF987D3": {
+    "Host": "127.0.0.1",
+    "Port": "6379",
+    "Username": "",
+    "Password": "foobared"
+  }
+}
