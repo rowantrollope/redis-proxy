@@ -2,80 +2,46 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/json"
-	"fmt"
-	"io"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
-	"os"
 	"strconv"
 	"sync"
 	"time"
-
-	"encoding/binary"
+	"crypto/rand"
+	"math/big"
+	"fmt"
+	"encoding/json"
+	"io"
+	
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
-	"github.com/joho/godotenv"
-)
-
-// Define the possible client disconnect methods
-type ClientDisconnectMethod string
-
-const (
-	DISCONNECT_AUTO    ClientDisconnectMethod = "AUTO"
-	DISCONNECT_TIMEOUT ClientDisconnectMethod = "TIMEOUT"
-	DISCONNECT_NONE    ClientDisconnectMethod = "NONE"
-)
-
-type ActivationState string
-
-const (
-	ActivationStatePending     = "ACTIVATION_PENDING"
-	ActivationStateActivated   = "ACTIVATED"
-	ActivationStateDeactivated = "DEACTIVATED"
 )
 
 type Server struct {
 	agentUpgrader websocket.Upgrader
-
-	agents sync.Map // Concurrent safe map[string]*Agent
-
-	basePort int
-	port     int
+	agents        sync.Map // Concurrent safe map[string]*Agent
+	basePort      int
+	port          int
 
 	rdb *redis.Client   // Redis client for database
 	ctx context.Context // Context for Redis operations
 
-	// Add the following fields
 	listenerPerRedisServerID      map[string]net.Listener
 	listenerPerRedisServerIDMutex sync.RWMutex
 
-	// Client disconnect method
 	clientDisconnectMethod ClientDisconnectMethod
 
-	// Active clients counter
 	activeClients      map[string]int
 	activeClientsMutex sync.Mutex
 }
 
-type RedisServerInfo struct {
-	RedisServerID   string `json:"redis_server_id"`
-	AccountID       string `json:"account_id"`
-	AgentID         string `json:"agent_id"`
-	Status          string `json:"status"`
-	Timestamp       int64  `json:"timestamp"`
-	ActivationState string `json:"activation_state"`
-}
-
+// NewServer initializes a new Server instance
 func NewServer(disconnectMethod ClientDisconnectMethod) *Server {
 	return &Server{
 		agentUpgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
-		agents:                   sync.Map{},
 		basePort:                 6400,
 		port:                     8080,
 		ctx:                      context.Background(),
@@ -85,544 +51,200 @@ func NewServer(disconnectMethod ClientDisconnectMethod) *Server {
 	}
 }
 
-// Agent represents a connected agent with its clients
-type Agent struct {
-	conn       *websocket.Conn
-	clients    map[uint64]*Client // Map ClientID to Client
-	clientsMux sync.RWMutex       // Mutex for clients map
-	register   chan *Client
-	unregister chan *Client
-	messages   chan Message // Channel for incoming messages with ClientID
-	done       chan struct{}
-	pingPeriod time.Duration
-	pongWait   time.Duration
-	send       chan Message
-	agentID    string  // Add agentID field
-	server     *Server // Add reference to Server
-
-	connected bool
-	mu        sync.Mutex
-}
-
-// Client represents a connected client
-type Client struct {
-	ID             uint64
-	conn           net.Conn
-	send           chan []byte
-	lastActive     time.Time
-	RedisServerID  string    // Add this field
-	disconnectOnce sync.Once // Add this field
-	disconnectChan chan struct{}
-}
-
-type Message struct {
-	ClientID    uint64
-	Data        []byte
-	MessageType string // "control" or "data" (optional)
-}
-
-var clientIDCounter uint64
-var clientIDMutex = &sync.Mutex{}
-
-func generateUniqueClientID() uint64 {
-	clientIDMutex.Lock()
-	defer clientIDMutex.Unlock()
-	clientIDCounter++
-	return clientIDCounter
-}
-
-func main() {
-	// Configure the logger to include timestamps and file line numbers
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-
-	server := NewServer(DISCONNECT_NONE)
-
-	// Load environment variables from .env file
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("No .env file found or error loading .env file, proceeding to use system environment variables")
-	}
-
-	// Read Redis configuration from environment variables
-	redisAddr := os.Getenv("REDIS_ADDRESS")
-	redisPassword := os.Getenv("REDIS_PASSWORD")
-
-	// Check if Redis address is set
-	if redisAddr == "" {
-		log.Fatal("REDIS_ADDRESS environment variable is not set")
-	}
-
-	// Initialize Redis client
-	server.rdb = redis.NewClient(&redis.Options{
-		Addr:     redisAddr, // Adjust as needed
-		Password: redisPassword,
-	})
-
-	// Test Redis connection
-	_, err = server.rdb.Ping(server.ctx).Result()
-
-	if err != nil {
-		log.Fatal("Error connecting to Redis:", err)
-	}
-
-	log.Println("Connected to Redis")
-
+// Start initializes the HTTP server and routes
+func (s *Server) Start() {
 	// Create a new ServeMux
 	mux := http.NewServeMux()
 
 	// Register your handlers
-	mux.HandleFunc("/agent", server.handleAgentConnection)
-	mux.HandleFunc("/servers", server.handleGetServers)
-	mux.HandleFunc("/stats", server.handleGetStats)
-	mux.HandleFunc("/connect", server.handleConnectToRedisServer)
-	mux.HandleFunc("/disconnect", server.handleDisconnectFromRedisServer)
-	mux.HandleFunc("/activation/claim", server.handleActivationClaim)
-	mux.HandleFunc("/activation/deactivate", server.handleDeactivateRedisServer)
+	mux.HandleFunc("/agent", s.handleAgentConnection)
+	mux.HandleFunc("/servers", s.handleGetServers)
+	mux.HandleFunc("/stats", s.handleGetStats)
+	mux.HandleFunc("/connect", s.handleConnectToRedisServer)
+	mux.HandleFunc("/disconnect", s.handleDisconnectFromRedisServer)
+	mux.HandleFunc("/activation/claim", s.handleActivationClaim)
+	mux.HandleFunc("/activation/deactivate", s.handleDeactivateRedisServer)
 
 	// Wrap the mux with the CORS middleware
 	handler := enableCors(mux)
 
 	// Start the HTTP server with the handler
-	log.Printf("Server listening on :%d for agents and API requests", server.port)
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", server.port), handler); err != nil {
+	log.Printf("Server listening on :%d for agents and API requests", s.port)
+	if err := http.ListenAndServe(fmt.Sprintf(":%d", s.port), handler); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }
 
-func (s *Server) handleDeactivateRedisServer(w http.ResponseWriter, r *http.Request) {
-	redisServerID := r.URL.Query().Get("redisServerId")
-	if redisServerID == "" {
-		http.Error(w, "Missing redisServerID parameter", http.StatusBadRequest)
+// StoreAgent stores the agent instance
+func (s *Server) StoreAgent(agentID string, agent *Agent) {
+	s.agents.Store(agentID, agent)
+}
+
+// LoadAgent retrieves the agent instance
+func (s *Server) LoadAgent(agentID string) (*Agent, bool) {
+	value, ok := s.agents.Load(agentID)
+	if !ok {
+		return nil, false
+	}
+	return value.(*Agent), true
+}
+
+func (s *Server) incrementClientCounter(redisServerID string) {
+	if s.clientDisconnectMethod == DISCONNECT_AUTO {
+		s.activeClientsMutex.Lock()
+		s.activeClients[redisServerID]++
+		s.activeClientsMutex.Unlock()
+	}
+}
+
+func (s *Server) decrementClientCounter(redisServerID string) {
+	if s.clientDisconnectMethod == DISCONNECT_AUTO {
+		s.activeClientsMutex.Lock()
+		s.activeClients[redisServerID]--
+		count := s.activeClients[redisServerID]
+		s.activeClientsMutex.Unlock()
+
+		// Check if count is zero and close the listener if needed
+		if count == 0 {
+			s.closeListenerIfNoClients(redisServerID)
+		}
+	}
+}
+
+// generateActivationCode generates a cryptographically secure activation code
+func (server *Server) generateActivationCode() (string, error) {
+    // I and O are removed to avoid confusion with 1 and 0
+    const charset = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789"
+    code := make([]byte, 8) // 8 characters (without the dash)
+
+    for i := range code {
+        num, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+        if err != nil {
+            return "", err
+        }
+        code[i] = charset[num.Int64()]
+    }
+
+    // Insert the dash in the middle
+    activationCode := fmt.Sprintf("%s-%s", string(code[:4]), string(code[4:]))
+    return activationCode, nil
+}
+
+// closeListenerIfNoClients checks if there are no active clients for the given redisServerID
+// and closes the listener if that's the case.
+func (s *Server) closeListenerIfNoClients(redisServerID string) {
+	s.activeClientsMutex.Lock()
+	count := s.activeClients[redisServerID]
+	s.activeClientsMutex.Unlock()
+
+	if count > 0 {
+		// There are still active clients; no action needed.
 		return
 	}
 
-	// Read the server info
-	serverInfo, err := s.readServerInfo(redisServerID)
-	if err != nil {
-		http.Error(w, "Redis server not found", http.StatusNotFound)
-		return
+	// Close the listener for redisServerID
+	s.listenerPerRedisServerIDMutex.Lock()
+	listener, exists := s.listenerPerRedisServerID[redisServerID]
+	if exists {
+		log.Printf("Closing listener for redisServerID %s as there are no active clients", redisServerID)
+		err := listener.Close()
+		if err != nil {
+			log.Printf("Error closing listener for redisServerID %s: %v", redisServerID, err)
+		}
+		delete(s.listenerPerRedisServerID, redisServerID)
 	}
+	s.listenerPerRedisServerIDMutex.Unlock()
+}
 
-	// Set the activation state to DEACTIVATED
-	serverInfo.ActivationState = ActivationStateDeactivated
-
-	// Update the server info in Redis
-	err = s.writeServerInfo(redisServerID, serverInfo)
-	if err != nil {
-		http.Error(w, "Failed to update server info", http.StatusInternalServerError)
-		return
-	}
-
-	// Remove the association between the agentID and the redisServerID
-	agentID, err := s.getAgentIDForRedisServerID(redisServerID)
-	if err != nil {
-		// No agent found, proceed
+func (s *Server) handleDisconnectForRedisServerID(redisServerID string) error {
+	// Close the listener for redisServerID
+	s.listenerPerRedisServerIDMutex.Lock()
+	listener, exists := s.listenerPerRedisServerID[redisServerID]
+	if exists {
+		log.Printf("Closing listener for redisServerID %s", redisServerID)
+		err := listener.Close()
+		if err != nil {
+			log.Printf("Error closing listener for redisServerID %s: %v", redisServerID, err)
+			s.listenerPerRedisServerIDMutex.Unlock()
+			return err
+		}
+		delete(s.listenerPerRedisServerID, redisServerID)
+		log.Printf("Listener for redisServerID %s has been closed and removed from the map", redisServerID)
 	} else {
-		// Send control message to the agent to stop managing this redisServerID
-		controlMsg := map[string]interface{}{
-			"message_type":    "__deactivate_redis_server__",
-			"redis_server_id": redisServerID,
-		}
-		err = s.sendControlMessage(agentID, controlMsg)
-		if err != nil {
-			log.Println("Error sending control message to agent:", err)
-		}
-
-		// Remove the mapping in Redis
-		err = s.rdb.SRem(s.ctx, "agentIDToRedisServerIDs:"+agentID, redisServerID).Err()
-		if err != nil {
-			log.Println("Error removing redisServerID from agentIDToRedisServerIDs:", err)
-		}
-		err = s.rdb.Del(s.ctx, "redisServerIDToAgentID:"+redisServerID).Err()
-		if err != nil {
-			log.Println("Error deleting redisServerIDToAgentID mapping:", err)
-		}
+		log.Printf("Listener for redisServerID %s not found", redisServerID)
 	}
+	s.listenerPerRedisServerIDMutex.Unlock()
 
-	// Remove redisServerID from accountServers
-	accountID := serverInfo.AccountID
-	if accountID != "" {
-		err = s.rdb.SRem(s.ctx, "accountServers:"+accountID, redisServerID).Err()
-		if err != nil {
-			log.Println("Error removing redisServerID from accountServers:", err)
-		}
-	}
-
-	// Delete the server info from Redis
-	err = s.rdb.Del(s.ctx, "redis_server_id:"+redisServerID).Err()
-	if err != nil {
-		log.Println("Error deleting server info from Redis:", err)
-	}
-
-	// Delete the heartbeat stream
-	streamKey := fmt.Sprintf("redis_server_id:%s:heartbeat_stream", redisServerID)
-	err = s.rdb.Del(s.ctx, streamKey).Err()
-	if err != nil {
-		log.Println("Error deleting heartbeat stream from Redis:", err)
-	}
-
-	// Respond success
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Redis server deactivated and removed successfully"))
-}
-
-func (s *Server) readServerInfo(redisServerID string) (RedisServerInfo, error) {
-	serverInfoData, err := s.rdb.Do(s.ctx, "JSON.GET", "redis_server_id:"+redisServerID).Result()
-	
-	if err != nil {
-		return RedisServerInfo{}, fmt.Errorf("error getting server info for redisServerID: %s, error: %v", redisServerID, err)
-	}
-
-	// Convert the result to a string or byte slice
-	var serverInfo RedisServerInfo
-	switch data := serverInfoData.(type) {
-	case string:
-		err = json.Unmarshal([]byte(data), &serverInfo)
-	case []byte:
-		err = json.Unmarshal(data, &serverInfo)
-	default:
-		return RedisServerInfo{}, fmt.Errorf("unexpected data type for server info: %T", serverInfoData)
-	}
+	// Now disconnect clients associated with the redisServerID
+	agentID, err := s.getAgentIDForRedisServerID(redisServerID)
 
 	if err != nil {
-		return RedisServerInfo{}, fmt.Errorf("error unmarshaling server info for redisServerID: %s, error: %v", redisServerID, err)
+		log.Printf("No agent found for redisServerID %s", redisServerID)
+		return nil // Or return an error if necessary
 	}
 
-	return serverInfo, nil
-}
-
-func (s *Server) writeServerInfo(redisServerID string, serverInfo RedisServerInfo) error {
-	// Store the redisServerInfo as a JSON object in Redis
-	redisServerInfoJSON, err := json.Marshal(serverInfo)
-	if err != nil {
-		log.Println("Error marshaling server info:", err)
-		return err
+	agent, ok := s.LoadAgent(agentID)
+	if !ok {
+		log.Printf("Agent %s not found", agentID)
+		return nil // Or return an error if necessary
 	}
 
-	// Use JSON.SET command to store the JSON object
-	_, err = s.rdb.Do(s.ctx, "JSON.SET", "redis_server_id:"+redisServerID, ".", redisServerInfoJSON).Result()
-	if err != nil {
-		log.Println("Error setting server info in Redis:", err)
-		return err
-	}
+	// Instruct the agent to disconnect clients associated with redisServerID
+	agent.disconnectClients(redisServerID)
+
 	return nil
 }
-	
 
-// Handle activation claim requests from clients (management console)
-func (s *Server) handleActivationClaim(w http.ResponseWriter, r *http.Request) {
-	activationCode := r.URL.Query().Get("activationCode")
-	accountID := r.URL.Query().Get("accountID")
-
-	log.Println("handleActivationClaim activation code: " + activationCode + " accountID: " + accountID)
-
-	if activationCode == "" || accountID == "" {
-		http.Error(w, "Missing activationCode or accountID parameter", http.StatusBadRequest)
+// handleDisconnectFromRedisServer handles the API request to disconnect from an agent
+func (s *Server) handleDisconnectFromRedisServer(w http.ResponseWriter, r *http.Request) {
+	redisServerID := r.URL.Query().Get("redis_server_id")
+	log.Printf("Received /disconnect request for redis_server_id: %s", redisServerID)
+	if redisServerID == "" {
+		http.Error(w, "redis_server_id is required", http.StatusBadRequest)
 		return
 	}
 
-	redisServerID, err := s.claimActivationCode(activationCode)
+	// Proceed to disconnect the agent
+	err := s.handleDisconnectForRedisServerID(redisServerID)
 	if err != nil {
-		log.Println("Error claiming activation code:", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		log.Printf("Error disconnecting redis_server_id %s: %v", redisServerID, err)
+		http.Error(w, "Failed to disconnect", http.StatusInternalServerError)
 		return
 	}
 
-	// Create the ServerInfo object
-	redisServerInfo := RedisServerInfo{
-		AccountID: accountID,
-		Status:    "RUNNING",
-		Timestamp: time.Now().Unix(),
-		ActivationState: ActivationStateActivated,
-		RedisServerID:   redisServerID,
-	}
-
-	err = s.writeServerInfo(redisServerID, redisServerInfo)
-	if err != nil {
-		log.Println("Error writing server info:", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	// Add redisServerID to the set of servers for the accountID
-	err = s.rdb.SAdd(s.ctx, "accountServers:"+accountID, redisServerID).Err()
-	if err != nil {
-		log.Println("Error adding UUID to accountServers:", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	// Inform the agent that the server is activated - send a control message "__activation_complete__"
-	controlMsg := map[string]interface{}{
-		"message_type":    "__activation_claimed__",
-		"redis_server_id": redisServerID,
-	}
-	agentID, err := s.getAgentIDForRedisServerID(redisServerID)
-	if err != nil {
-		log.Printf("Error retrieving agentID for redisServerID %s: %v", redisServerID, err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-	s.sendControlMessage(agentID, controlMsg)
-
-	// Respond with success
-	log.Println("handleActivationClaim success")
-	response := map[string]string{
-		"status":          "activation code claimed successfully",
-		"redis_server_id": redisServerID,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	log.Printf("Successfully disconnected redis_server_id %s", redisServerID)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Disconnected successfully"))
 }
 
-// Store mapping from agentID to redisServerID
-func (s *Server) associateAgentWithRedisServerID(agentID, redisServerID string) error {
-	key := "agentIDToRedisServerIDs:" + agentID
-	err := s.rdb.SAdd(s.ctx, key, redisServerID).Err()
-	if err != nil {
-		return err
-	}
-	// Also store reverse mapping
-	return s.rdb.Set(s.ctx, "redisServerIDToAgentID:"+redisServerID, agentID, 0).Err()
-}
-
-// Get all redisServerIDs associated with an agentID
-func (s *Server) getRedisServerIDsForAgent(agentID string) ([]string, error) {
-	key := "agentIDToRedisServerIDs:" + agentID
-	return s.rdb.SMembers(s.ctx, key).Result()
-}
-
-// Get serverID for  redisServerIDs associated with an agentID
-func (s *Server) getAgentIDForRedisServerID(redisServerID string) (string, error) {
-	key := "redisServerIDToAgentID:" + redisServerID
-	return s.rdb.Get(s.ctx, key).Result()
-}
-
-// Handle retrieval of servers associated with an accountID
-func (s *Server) handleGetServers(w http.ResponseWriter, r *http.Request) {
-	accountID := r.URL.Query().Get("accountID")
-	if accountID == "" {
-		http.Error(w, "Missing accountID parameter", http.StatusBadRequest)
-		return
-	}
-
-	// Get the set of UUIDs associated with the accountID
-	uuids, err := s.rdb.SMembers(s.ctx, "accountServers:"+accountID).Result()
-	if err != nil {
-		log.Println("Error getting servers for accountID:", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	// Prepare a slice to hold server info
-	servers := []map[string]string{}
-
-	// For each UUID, retrieve the serverInfo JSON object
-	for _, uuid := range uuids {
-		// Get the JSON data from Redis
-		serverInfoData, err := s.readServerInfo(uuid)
-
-		if err != nil {
-			log.Println("Error getting server info for UUID:", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		// Append server info to the list
-		servers = append(servers, map[string]string{
-			"uuid": serverInfoData.RedisServerID,
-		})
-	}
-
-	response := map[string][]map[string]string{
-		"servers": servers,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-// Handle retrieval of servers associated with a databaseID
-func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
-    redisServerId := r.URL.Query().Get("id")
-    if redisServerId == "" {
-        http.Error(w, "Missing redisServerId parameter", http.StatusBadRequest)
-        return
-    }
-
-    // Construct the stream key
-    streamKey := fmt.Sprintf("redis_server_id:%s:heartbeat_stream", redisServerId)
-
-    // Read the latest entry from the stream using XRevRangeN
-    streamEntries, err := s.rdb.XRevRangeN(s.ctx, streamKey, "+", "-", 1).Result()
-    if err != nil {
-        log.Printf("Error reading from stream for redisServerId %s: %v", redisServerId, err)
-        http.Error(w, "Internal server error", http.StatusInternalServerError)
-        return
-    }
-
-    // Check if there are any entries
-    if len(streamEntries) == 0 {
-        http.Error(w, "No entries in the stream", http.StatusNotFound)
-        return
-    }
-
-    // Get the latest entry
-    entry := streamEntries[0]
-
-    // Convert the response map to JSON
-    statsJSON, err := json.Marshal(entry.Values)
-    if err != nil {
-        log.Printf("Error marshaling stats: %v", err)
-        http.Error(w, "Internal server error", http.StatusInternalServerError)
-        return
-    }
-	
-    // Set the content type and write the JSON response
-    w.Header().Set("Content-Type", "application/json")
-    w.Write(statsJSON)
-}
-// handleAgentConnection handles WebSocket connections from agents
-func (s *Server) handleAgentConnection(w http.ResponseWriter, r *http.Request) {
-	log.Println("Received a new agent connection request")
-	// Upgrade HTTP to WebSocket
-	wsConn, err := s.agentUpgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("Failed to upgrade to WebSocket: %v", err)
-		http.Error(w, fmt.Sprintf("Failed to upgrade to WebSocket: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	// Read the agent ID sent by the agent
-	log.Println("Waiting to receive agent ID")
-	_, agentIDBytes, err := wsConn.ReadMessage()
-	if err != nil {
-		log.Printf("Failed to read agent ID: %v", err)
-		http.Error(w, fmt.Sprintf("Failed to read agent ID: %v", err), http.StatusBadRequest)
-		wsConn.Close()
-		return
-	}
-	agentID := string(agentIDBytes)
-	log.Printf("Agent connected: %s", agentID)
-
-	agent := &Agent{
-		conn:       wsConn,
-		clients:    make(map[uint64]*Client),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		messages:   make(chan Message),
-		done:       make(chan struct{}),
-		pingPeriod: 54 * time.Second,
-		pongWait:   60 * time.Second,
-		send:       make(chan Message, 100), // Make agent.send a buffered channel
-		agentID:    agentID,
-		server:     s,
-		connected:  true, // Set connected to true
-	}
-
-	// Store the agent
-	s.StoreAgent(agentID, agent)
-
-	// Retrieve redisServerIDs associated with this agentID from Redis
-	redisServerIDs, err := s.getRedisServerIDsForAgent(agentID)
-	if err != nil {
-		log.Printf("Error retrieving redisServerIDs for agentID %s: %v", agentID, err)
-	}
-
-	log.Printf("redisServerIDs for agentID %s: %v", agentID, redisServerIDs)
-
-	// Start agent's run loop
-	go agent.run()
-
-	// Start read and write pumps
-	go agent.readPump()
-	go agent.writePump()
-
-	// Set up ping/pong handlers to detect disconnections
-	agent.setupPingPong()
-
-	// Optionally, send periodic pings
-	go agent.startPing()
-}
-
-// agent.run handles registration and broadcasting to clients
-func (agent *Agent) run() {
-	for {
-		select {
-		case message := <-agent.messages:
-			// Route the message to the correct client
-			agent.clientsMux.RLock()
-			client, ok := agent.clients[message.ClientID]
-			agent.clientsMux.RUnlock()
-			if ok {
-				client.send <- message.Data
-			} else {
-				log.Printf("Client %d not found for agent %s", message.ClientID, agent.agentID)
-			}
-		}
-	}
-}
-
-// agent.readPump reads from wsConn and broadcasts to clients
-func (agent *Agent) readPump() {
-	defer func() {
-		agent.conn.Close()
-	}()
-	for {
-		_, reader, err := agent.conn.NextReader()
-		if err != nil {
-			log.Printf("Error reading from WebSocket: %v", err)
+func (s *Server) createListenerForRedisServerID(redisServerID string) net.Listener {
+	// Find an available port
+	var listener net.Listener
+	var err error
+	for port := s.basePort; port < 65535; port++ {
+		address := "127.0.0.1:" + strconv.Itoa(port)
+		listener, err = net.Listen("tcp", address)
+		if err == nil {
+			log.Printf("Allocated port %d for redisServerID %s", port, redisServerID)
 			break
 		}
-
-		for {
-			message, err := readMessage(reader)
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				log.Printf("Error reading message: %v", err)
-				break
-			}
-			if message.ClientID == 0 {
-				// Control message
-				err := agent.handleControlMessage(message.Data)
-				if err != nil {
-					log.Printf("Error handling control message: %v", err)
-				}
-			} else {
-				// Data message
-				// Send the message to the appropriate client
-				agent.messages <- message
-			}
-		}
 	}
+	if listener == nil {
+		log.Printf("No available ports to allocate for redisServerID %s", redisServerID)
+		return nil
+	}
+
+	log.Printf("Listener started on %s for redisServerID %s", listener.Addr().String(), redisServerID)
+
+	// Start accepting client connections on the new port
+	go s.acceptClients(listener, redisServerID)
+	return listener
 }
 
-func (agent *Agent) handleControlMessage(data []byte) error {
-	// Parse the JSON data
-	var controlMsg map[string]interface{}
-	err := json.Unmarshal(data, &controlMsg)
-	if err != nil {
-		return fmt.Errorf("failed to parse control message JSON: %v", err)
-	}
-
-	// Extract the message type
-	msgType, ok := controlMsg["message_type"].(string)
-	if !ok {
-		return fmt.Errorf("control message missing 'message_type' field")
-	}
-
-	switch msgType {
-	case "__activation_request__":
-		// Handle activation
-		return agent.server.handleActivationRequest(agent.agentID, controlMsg)
-	case "__agent_managed_redis_server__":
-		return agent.server.handleAgentManagedRedisServer(controlMsg, agent.agentID)
-	case "__redis_server_heartbeat__":
-		return agent.server.handleRedisServerHeartbeat(controlMsg, agent.agentID)
-	default:
-		return fmt.Errorf("unknown control message type: %s", msgType)
-	}
+// handleDisconnectForAgent closes the listener for the given agentID
+func (s *Server) handleDisconnectForAgent(agentID string) error {
+	log.Printf("Disconnecting agent %s - TODO: nothing done", agentID)
+	return nil
 }
 
 func (s *Server) handleRedisServerHeartbeat(controlMsg map[string]interface{}, agentID string) error {
@@ -764,7 +386,7 @@ func (s *Server) handleActivationRequest(agentID string, controlMsg map[string]i
 			AccountID:       "",
 			Status:          "RUNNING",
 			Timestamp:       time.Now().Unix(),
-			ActivationState: ActivationStatePending,
+			ActivationState: string(ActivationStatePending),
 		}
 
 		// Store the new RedisServerInfo
@@ -775,7 +397,7 @@ func (s *Server) handleActivationRequest(agentID string, controlMsg map[string]i
 
 		// Send activation code to the agent
 		// send status = "new_server" and activation_code
-		responseData := map[string]string{"state": ActivationStatePending, "activation_code": activationCode}
+		responseData := map[string]string{"state": string(ActivationStatePending), "activation_code": activationCode}
 
 		return s.sendActivationResponse(agentID, requestID, responseData)
 
@@ -783,7 +405,7 @@ func (s *Server) handleActivationRequest(agentID string, controlMsg map[string]i
 
 		// Handle based on the current activation state
 		switch serverInfo.ActivationState {
-		case ActivationStatePending:
+		case string(ActivationStatePending):
 
 			// Send existing activation code to the agent
 			activationCode, err := s.getActivationCode(redisServerID)
@@ -795,11 +417,11 @@ func (s *Server) handleActivationRequest(agentID string, controlMsg map[string]i
 				return fmt.Errorf("error retrieving activation code: %v", err)
 			}
 
-		case ActivationStateActivated:
+		case string(ActivationStateActivated):
 			responseData := map[string]bool{"activated": true}
 			return s.sendActivationResponse(agentID, requestID, responseData)
 
-		case ActivationStateDeactivated:
+		case string(ActivationStateDeactivated):
 			responseData := map[string]bool{"activated": false}
 			return s.sendActivationResponse(agentID, requestID, responseData)
 
@@ -818,12 +440,12 @@ func (s *Server) claimActivationCode(activationCode string) (string, error) {
 		// Activation code not found or already claimed
 		return "", fmt.Errorf("invalid or already claimed activation code")
 		//http.Error(w, "Invalid or already claimed activation code", http.StatusNotFound)
-		
+
 	} else if err != nil {
 		log.Println("Error checking pending activation:", err)
 		return "", fmt.Errorf("internal server error", err)
 		//http.Error(w, "Internal server error", http.StatusInternalServerError)
-		
+
 	}
 
 	// Remove the pending activation
@@ -832,7 +454,7 @@ func (s *Server) claimActivationCode(activationCode string) (string, error) {
 		log.Println("Error deleting pending activation:", err)
 		return "", fmt.Errorf("internal server error", err)
 		//http.Error(w, "Internal server error", http.StatusInternalServerError)
-		
+
 	}
 
 	// Remove the server_id mapping
@@ -903,30 +525,6 @@ func (s *Server) sendActivationResponse(agentID, requestID string, responseData 
 
 	agent.send <- message
 	return nil
-}
-
-// generateActivationCode generates a cryptographically secure activation code
-// in the format XXXX-XXXX, where each X is an uppercase alphanumeric character.
-func (server *Server) generateActivationCode() (string, error) {
-	// I and O are removed to avoid confusion with 1 and 0
-	const charset = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789"
-	code := make([]byte, 8) // 8 characters (without the dash)
-
-	for i := range code {
-		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
-		if err != nil {
-			return "", err
-		}
-		code[i] = charset[num.Int64()]
-	}
-
-	// Insert the dash in the middle
-	activationCode := fmt.Sprintf("%s-%s", string(code[:4]), string(code[4:]))
-	return activationCode, nil
-}
-
-func (agent *Agent) unregisterClientByID(clientID uint64) {
-	agent.unregister <- &Client{ID: clientID}
 }
 
 func (s *Server) sendControlMessage(agentID string, controlData map[string]interface{}) error {
@@ -1149,371 +747,315 @@ func (s *Server) handleClient(clientConn net.Conn, redisServerID string) {
 	}()
 }
 
-func (c *Client) monitorInactivity(timeout time.Duration) {
-	go func() {
-		ticker := time.NewTicker(time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				if time.Since(c.lastActive) > timeout {
-					log.Printf("Client %d inactive for %v, disconnecting", c.ID, timeout)
-					c.disconnect()
-					return
-				}
-			case <-c.disconnectChan:
-				// Stop monitoring when client is disconnected
-				return
-			}
-		}
-	}()
-}
-
-// client.writePump sends messages from the agent to the client
-func (agent *Agent) writePump() {
-	for message := range agent.send {
-		writer, err := agent.conn.NextWriter(websocket.BinaryMessage)
-		if err != nil {
-			// Handle error
-			return
-		}
-		// Write ClientID (8 bytes)
-		err = binary.Write(writer, binary.BigEndian, message.ClientID)
-		if err != nil {
-			writer.Close()
-			return
-		}
-		// Write MessageLength (4 bytes)
-		length := uint32(len(message.Data))
-		err = binary.Write(writer, binary.BigEndian, length)
-		if err != nil {
-			writer.Close()
-			return
-		}
-		// Write MessageData
-		_, err = writer.Write(message.Data)
-		if err != nil {
-			writer.Close()
-			return
-		}
-		writer.Close()
-	}
-}
-
-// handleDisconnectForAgent closes the listener for the given agentID
-func (s *Server) handleDisconnectForAgent(agentID string) error {
-	log.Printf("Disconnecting agent %s - TODO: nothing done", agentID)
-	return nil
-}
-
-func (s *Server) StoreAgent(agentID string, agent *Agent) {
-	s.agents.Store(agentID, agent)
-}
-
-func (s *Server) LoadAgent(agentID string) (*Agent, bool) {
-	value, ok := s.agents.Load(agentID)
-	if !ok {
-		return nil, false
-	}
-	return value.(*Agent), true
-}
-
-func (agent *Agent) setupPingPong() {
-	agent.conn.SetReadDeadline(time.Now().Add(agent.pongWait))
-	agent.conn.SetPongHandler(func(string) error {
-		agent.conn.SetReadDeadline(time.Now().Add(agent.pongWait))
-		return nil
-	})
-}
-
-func (agent *Agent) startPing() {
-	ticker := time.NewTicker(agent.pingPeriod)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-agent.done:
-			return
-		case <-ticker.C:
-			if err := agent.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				// Handle disconnection
-				log.Printf("Agent %s disconnecting due to ping timeout", agent.agentID)
-				agent.disconnect()
-				return
-			}
-		}
-	}
-}
-
-func (agent *Agent) disconnect() {
-	agent.mu.Lock()
-	if !agent.connected {
-		agent.mu.Unlock()
-		return
-	}
-	agent.connected = false
-	agent.mu.Unlock()
-
-	close(agent.done)
-	agent.conn.Close()
-
-	// Close agent.send to signal writePump to exit
-	close(agent.send)
-
-	// Disconnect all clients
-	agent.clientsMux.Lock()
-	for _, client := range agent.clients {
-		client.conn.Close()
-	}
-	agent.clientsMux.Unlock()
-
-	// Handle agent disconnect
-	agent.server.handleDisconnectForAgent(agent.agentID)
-}
-
-func readMessage(reader io.Reader) (Message, error) {
-	var msg Message
-	// Read ClientID (8 bytes)
-	err := binary.Read(reader, binary.BigEndian, &msg.ClientID)
-	if err != nil {
-		return msg, err
-	}
-	// Read MessageLength (4 bytes)
-	var length uint32
-	err = binary.Read(reader, binary.BigEndian, &length)
-	if err != nil {
-		return msg, err
-	}
-	// Read MessageData
-	msg.Data = make([]byte, length)
-	_, err = io.ReadFull(reader, msg.Data)
-	if err != nil {
-		return msg, err
-	}
-	return msg, nil
-}
-
-// handleDisconnectFromRedisServer handles the API request to disconnect from an agent
-func (s *Server) handleDisconnectFromRedisServer(w http.ResponseWriter, r *http.Request) {
-	redisServerID := r.URL.Query().Get("redis_server_id")
-	log.Printf("Received /disconnect request for redis_server_id: %s", redisServerID)
+func (s *Server) handleDeactivateRedisServer(w http.ResponseWriter, r *http.Request) {
+	redisServerID := r.URL.Query().Get("redisServerId")
 	if redisServerID == "" {
-		http.Error(w, "redis_server_id is required", http.StatusBadRequest)
+		http.Error(w, "Missing redisServerID parameter", http.StatusBadRequest)
 		return
 	}
 
-	// Proceed to disconnect the agent
-	err := s.handleDisconnectForRedisServerID(redisServerID)
+	// Read the server info
+	serverInfo, err := s.readServerInfo(redisServerID)
 	if err != nil {
-		log.Printf("Error disconnecting redis_server_id %s: %v", redisServerID, err)
-		http.Error(w, "Failed to disconnect", http.StatusInternalServerError)
+		http.Error(w, "Redis server not found", http.StatusNotFound)
 		return
 	}
 
-	log.Printf("Successfully disconnected redis_server_id %s", redisServerID)
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Disconnected successfully"))
-}
+	// Set the activation state to DEACTIVATED
+	serverInfo.ActivationState = string(ActivationStateDeactivated)
 
-func (s *Server) createListenerForRedisServerID(redisServerID string) net.Listener {
-	// Find an available port
-	var listener net.Listener
-	var err error
-	for port := s.basePort; port < 65535; port++ {
-		address := "127.0.0.1:" + strconv.Itoa(port)
-		listener, err = net.Listen("tcp", address)
-		if err == nil {
-			log.Printf("Allocated port %d for redisServerID %s", port, redisServerID)
-			break
-		}
-	}
-	if listener == nil {
-		log.Printf("No available ports to allocate for redisServerID %s", redisServerID)
-		return nil
+	// Update the server info in Redis
+	err = s.writeServerInfo(redisServerID, serverInfo)
+	if err != nil {
+		http.Error(w, "Failed to update server info", http.StatusInternalServerError)
+		return
 	}
 
-	log.Printf("Listener started on %s for redisServerID %s", listener.Addr().String(), redisServerID)
-
-	// Start accepting client connections on the new port
-	go s.acceptClients(listener, redisServerID)
-	return listener
-}
-
-// Add a client to the agent
-func (agent *Agent) addClient(client *Client) {
-	agent.clientsMux.Lock()
-	defer agent.clientsMux.Unlock()
-	agent.clients[client.ID] = client
-}
-
-// Remove a client from the agent
-func (agent *Agent) removeClient(client *Client) {
-	agent.clientsMux.Lock()
-	defer agent.clientsMux.Unlock()
-	delete(agent.clients, client.ID)
-	client.disconnectOnce.Do(func() {
-		close(client.send)
-	})
-}
-
-func (client *Client) writePump() {
-	for data := range client.send {
-		_, err := client.conn.Write(data)
-		if err != nil {
-			// Handle error
-			break
-		}
-	}
-}
-
-func (s *Server) handleDisconnectForRedisServerID(redisServerID string) error {
-	// Close the listener for redisServerID
-	s.listenerPerRedisServerIDMutex.Lock()
-	listener, exists := s.listenerPerRedisServerID[redisServerID]
-	if exists {
-		log.Printf("Closing listener for redisServerID %s", redisServerID)
-		err := listener.Close()
-		if err != nil {
-			log.Printf("Error closing listener for redisServerID %s: %v", redisServerID, err)
-			s.listenerPerRedisServerIDMutex.Unlock()
-			return err
-		}
-		delete(s.listenerPerRedisServerID, redisServerID)
-		log.Printf("Listener for redisServerID %s has been closed and removed from the map", redisServerID)
-	} else {
-		log.Printf("Listener for redisServerID %s not found", redisServerID)
-	}
-	s.listenerPerRedisServerIDMutex.Unlock()
-
-	// Now disconnect clients associated with the redisServerID
+	// Remove the association between the agentID and the redisServerID
 	agentID, err := s.getAgentIDForRedisServerID(redisServerID)
-
 	if err != nil {
-		log.Printf("No agent found for redisServerID %s", redisServerID)
-		return nil // Or return an error if necessary
-	}
+		// No agent found, proceed
+	} else {
+		// Send control message to the agent to stop managing this redisServerID
+		controlMsg := map[string]interface{}{
+			"message_type":    "__deactivate_redis_server__",
+			"redis_server_id": redisServerID,
+		}
+		err = s.sendControlMessage(agentID, controlMsg)
+		if err != nil {
+			log.Println("Error sending control message to agent:", err)
+		}
 
-	agent, ok := s.LoadAgent(agentID)
-	if !ok {
-		log.Printf("Agent %s not found", agentID)
-		return nil // Or return an error if necessary
-	}
-
-	// Instruct the agent to disconnect clients associated with redisServerID
-	agent.disconnectClients(redisServerID)
-
-	return nil
-}
-
-// In Agent struct, add the disconnectClients method
-func (agent *Agent) disconnectClients(redisServerID string) {
-	// Collect client IDs to disconnect
-	agent.clientsMux.Lock()
-	clientsToDisconnect := make([]uint64, 0)
-	for clientID, client := range agent.clients {
-		if client.RedisServerID == redisServerID {
-			clientsToDisconnect = append(clientsToDisconnect, clientID)
+		// Remove the mapping in Redis
+		err = s.rdb.SRem(s.ctx, "agentIDToRedisServerIDs:"+agentID, redisServerID).Err()
+		if err != nil {
+			log.Println("Error removing redisServerID from agentIDToRedisServerIDs:", err)
+		}
+		err = s.rdb.Del(s.ctx, "redisServerIDToAgentID:"+redisServerID).Err()
+		if err != nil {
+			log.Println("Error deleting redisServerIDToAgentID mapping:", err)
 		}
 	}
-	agent.clientsMux.Unlock()
 
-	// Now disconnect the clients
-	for _, clientID := range clientsToDisconnect {
-		agent.clientsMux.RLock()
-		client, ok := agent.clients[clientID]
-		agent.clientsMux.RUnlock()
-		if ok {
-			client.disconnect()
-			agent.removeClient(client)
+	// Remove redisServerID from accountServers
+	accountID := serverInfo.AccountID
+	if accountID != "" {
+		err = s.rdb.SRem(s.ctx, "accountServers:"+accountID, redisServerID).Err()
+		if err != nil {
+			log.Println("Error removing redisServerID from accountServers:", err)
 		}
 	}
-}
 
-// In Client struct, implement a disconnect method
-func (client *Client) disconnect() {
-	client.disconnectOnce.Do(func() {
-		close(client.disconnectChan)
-		client.conn.Close()
-		close(client.send)
-	})
-}
-
-func (agent *Agent) SendMessage(message Message) error {
-	agent.mu.Lock()
-	connected := agent.connected
-	agent.mu.Unlock()
-
-	if !connected {
-		return fmt.Errorf("agent is disconnected")
+	// Delete the server info from Redis
+	err = s.rdb.Del(s.ctx, "redis_server_id:"+redisServerID).Err()
+	if err != nil {
+		log.Println("Error deleting server info from Redis:", err)
 	}
 
-	select {
-	case agent.send <- message:
-		return nil
-	default:
-		return fmt.Errorf("agent send channel is full or closed")
+	// Delete the heartbeat stream
+	streamKey := fmt.Sprintf("redis_server_id:%s:heartbeat_stream", redisServerID)
+	err = s.rdb.Del(s.ctx, streamKey).Err()
+	if err != nil {
+		log.Println("Error deleting heartbeat stream from Redis:", err)
 	}
+
+	// Respond success
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Redis server deactivated and removed successfully"))
 }
 
-// enableCors is a middleware that sets the CORS headers
-func enableCors(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Adjust the allowed origin as needed. "*" allows all origins.
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
+// Handle activation claim requests from clients (management console)
+func (s *Server) handleActivationClaim(w http.ResponseWriter, r *http.Request) {
+	activationCode := r.URL.Query().Get("activationCode")
+	accountID := r.URL.Query().Get("accountID")
+
+	log.Println("handleActivationClaim activation code: " + activationCode + " accountID: " + accountID)
+
+	if activationCode == "" || accountID == "" {
+		http.Error(w, "Missing activationCode or accountID parameter", http.StatusBadRequest)
+		return
+	}
+
+	redisServerID, err := s.claimActivationCode(activationCode)
+	if err != nil {
+		log.Println("Error claiming activation code:", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Create the ServerInfo object
+	redisServerInfo := RedisServerInfo{
+		AccountID:       accountID,
+		Status:          "RUNNING",
+		Timestamp:       time.Now().Unix(),
+		ActivationState: string(ActivationStateActivated),
+		RedisServerID:   redisServerID,
+	}
+
+	err = s.writeServerInfo(redisServerID, redisServerInfo)
+	if err != nil {
+		log.Println("Error writing server info:", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Add redisServerID to the set of servers for the accountID
+	err = s.rdb.SAdd(s.ctx, "accountServers:"+accountID, redisServerID).Err()
+	if err != nil {
+		log.Println("Error adding UUID to accountServers:", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Inform the agent that the server is activated - send a control message "__activation_complete__"
+	controlMsg := map[string]interface{}{
+		"message_type":    "__activation_claimed__",
+		"redis_server_id": redisServerID,
+	}
+	agentID, err := s.getAgentIDForRedisServerID(redisServerID)
+	if err != nil {
+		log.Printf("Error retrieving agentID for redisServerID %s: %v", redisServerID, err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	s.sendControlMessage(agentID, controlMsg)
+
+	// Respond with success
+	log.Println("handleActivationClaim success")
+	response := map[string]string{
+		"status":          "activation code claimed successfully",
+		"redis_server_id": redisServerID,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// Store mapping from agentID to redisServerID
+func (s *Server) associateAgentWithRedisServerID(agentID, redisServerID string) error {
+	key := "agentIDToRedisServerIDs:" + agentID
+	err := s.rdb.SAdd(s.ctx, key, redisServerID).Err()
+	if err != nil {
+		return err
+	}
+	// Also store reverse mapping
+	return s.rdb.Set(s.ctx, "redisServerIDToAgentID:"+redisServerID, agentID, 0).Err()
+}
+
+// Get all redisServerIDs associated with an agentID
+func (s *Server) getRedisServerIDsForAgent(agentID string) ([]string, error) {
+	key := "agentIDToRedisServerIDs:" + agentID
+	return s.rdb.SMembers(s.ctx, key).Result()
+}
+
+// Get serverID for  redisServerIDs associated with an agentID
+func (s *Server) getAgentIDForRedisServerID(redisServerID string) (string, error) {
+	key := "redisServerIDToAgentID:" + redisServerID
+	return s.rdb.Get(s.ctx, key).Result()
+}
+
+// Handle retrieval of servers associated with an accountID
+func (s *Server) handleGetServers(w http.ResponseWriter, r *http.Request) {
+	accountID := r.URL.Query().Get("accountID")
+	if accountID == "" {
+		http.Error(w, "Missing accountID parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Get the set of UUIDs associated with the accountID
+	uuids, err := s.rdb.SMembers(s.ctx, "accountServers:"+accountID).Result()
+	if err != nil {
+		log.Println("Error getting servers for accountID:", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Prepare a slice to hold server info
+	servers := []map[string]string{}
+
+	// For each UUID, retrieve the serverInfo JSON object
+	for _, uuid := range uuids {
+		// Get the JSON data from Redis
+		serverInfoData, err := s.readServerInfo(uuid)
+
+		if err != nil {
+			log.Println("Error getting server info for UUID:", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
-		next.ServeHTTP(w, r)
-	})
-}
 
-func (s *Server) incrementClientCounter(redisServerID string) {
-	if s.clientDisconnectMethod == DISCONNECT_AUTO {
-		s.activeClientsMutex.Lock()
-		s.activeClients[redisServerID]++
-		s.activeClientsMutex.Unlock()
+		// Append server info to the list
+		servers = append(servers, map[string]string{
+			"uuid": serverInfoData.RedisServerID,
+		})
 	}
-}
 
-func (s *Server) decrementClientCounter(redisServerID string) {
-	if s.clientDisconnectMethod == DISCONNECT_AUTO {
-		s.activeClientsMutex.Lock()
-		s.activeClients[redisServerID]--
-		count := s.activeClients[redisServerID]
-		s.activeClientsMutex.Unlock()
-
-		// Check if count is zero and close the listener if needed
-		if count == 0 {
-			s.closeListenerIfNoClients(redisServerID)
-		}
+	response := map[string][]map[string]string{
+		"servers": servers,
 	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
-// closeListenerIfNoClients checks if there are no active clients for the given redisServerID
-// and closes the listener if that's the case.
-func (s *Server) closeListenerIfNoClients(redisServerID string) {
-	s.activeClientsMutex.Lock()
-	count := s.activeClients[redisServerID]
-	s.activeClientsMutex.Unlock()
-
-	if count > 0 {
-		// There are still active clients; no action needed.
+// Handle retrieval of servers associated with a databaseID
+func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
+	redisServerId := r.URL.Query().Get("id")
+	if redisServerId == "" {
+		http.Error(w, "Missing redisServerId parameter", http.StatusBadRequest)
 		return
 	}
 
-	// Close the listener for redisServerID
-	s.listenerPerRedisServerIDMutex.Lock()
-	listener, exists := s.listenerPerRedisServerID[redisServerID]
-	if exists {
-		log.Printf("Closing listener for redisServerID %s as there are no active clients", redisServerID)
-		err := listener.Close()
-		if err != nil {
-			log.Printf("Error closing listener for redisServerID %s: %v", redisServerID, err)
-		}
-		delete(s.listenerPerRedisServerID, redisServerID)
+	// Construct the stream key
+	streamKey := fmt.Sprintf("redis_server_id:%s:heartbeat_stream", redisServerId)
+
+	// Read the latest entry from the stream using XRevRangeN
+	streamEntries, err := s.rdb.XRevRangeN(s.ctx, streamKey, "+", "-", 1).Result()
+	if err != nil {
+		log.Printf("Error reading from stream for redisServerId %s: %v", redisServerId, err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
 	}
-	s.listenerPerRedisServerIDMutex.Unlock()
+
+	// Check if there are any entries
+	if len(streamEntries) == 0 {
+		http.Error(w, "No entries in the stream", http.StatusNotFound)
+		return
+	}
+
+	// Get the latest entry
+	entry := streamEntries[0]
+
+	// Convert the response map to JSON
+	statsJSON, err := json.Marshal(entry.Values)
+	if err != nil {
+		log.Printf("Error marshaling stats: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Set the content type and write the JSON response
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(statsJSON)
+}
+
+// handleAgentConnection handles WebSocket connections from agents
+func (s *Server) handleAgentConnection(w http.ResponseWriter, r *http.Request) {
+	log.Println("Received a new agent connection request")
+	// Upgrade HTTP to WebSocket
+	wsConn, err := s.agentUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Failed to upgrade to WebSocket: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to upgrade to WebSocket: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Read the agent ID sent by the agent
+	log.Println("Waiting to receive agent ID")
+	_, agentIDBytes, err := wsConn.ReadMessage()
+	if err != nil {
+		log.Printf("Failed to read agent ID: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to read agent ID: %v", err), http.StatusBadRequest)
+		wsConn.Close()
+		return
+	}
+	agentID := string(agentIDBytes)
+	log.Printf("Agent connected: %s", agentID)
+
+	agent := &Agent{
+		conn:       wsConn,
+		clients:    make(map[uint64]*Client),
+		register:   make(chan *Client),
+		unregister: make(chan *Client),
+		messages:   make(chan Message),
+		done:       make(chan struct{}),
+		pingPeriod: 54 * time.Second,
+		pongWait:   60 * time.Second,
+		send:       make(chan Message, 100), // Make agent.send a buffered channel
+		agentID:    agentID,
+		server:     s,
+		connected:  true, // Set connected to true
+	}
+
+	// Store the agent
+	s.StoreAgent(agentID, agent)
+
+	// Retrieve redisServerIDs associated with this agentID from Redis
+	redisServerIDs, err := s.getRedisServerIDsForAgent(agentID)
+	if err != nil {
+		log.Printf("Error retrieving redisServerIDs for agentID %s: %v", agentID, err)
+	}
+
+	log.Printf("redisServerIDs for agentID %s: %v", agentID, redisServerIDs)
+
+	// Start agent's run loop
+	go agent.run()
+
+	// Start read and write pumps
+	go agent.readPump()
+	go agent.writePump()
+
+	// Set up ping/pong handlers to detect disconnections
+	agent.setupPingPong()
+
+	// Optionally, send periodic pings
+	go agent.startPing()
 }
