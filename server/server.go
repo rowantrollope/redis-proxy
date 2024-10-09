@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -29,6 +28,14 @@ const (
 	DISCONNECT_AUTO    ClientDisconnectMethod = "AUTO"
 	DISCONNECT_TIMEOUT ClientDisconnectMethod = "TIMEOUT"
 	DISCONNECT_NONE    ClientDisconnectMethod = "NONE"
+)
+
+type ActivationState string
+
+const (
+	ActivationStatePending     = "ACTIVATION_PENDING"
+	ActivationStateActivated   = "ACTIVATED"
+	ActivationStateDeactivated = "DEACTIVATED"
 )
 
 type Server struct {
@@ -55,10 +62,12 @@ type Server struct {
 }
 
 type RedisServerInfo struct {
-	AccountID    string `json:"account_id"`
-	FriendlyName string `json:"friendly_name"`
-	Status       string `json:"status"`
-	Timestamp    int64  `json:"timestamp"`
+	RedisServerID   string `json:"redis_server_id"`
+	AccountID       string `json:"account_id"`
+	AgentID         string `json:"agent_id"`
+	Status          string `json:"status"`
+	Timestamp       int64  `json:"timestamp"`
+	ActivationState string `json:"activation_state"`
 }
 
 func NewServer(disconnectMethod ClientDisconnectMethod) *Server {
@@ -168,6 +177,7 @@ func main() {
 	mux.HandleFunc("/connect", server.handleConnectToRedisServer)
 	mux.HandleFunc("/disconnect", server.handleDisconnectFromRedisServer)
 	mux.HandleFunc("/activation/claim", server.handleActivationClaim)
+	mux.HandleFunc("/activation/deactivate", server.handleDeactivateRedisServer)
 
 	// Wrap the mux with the CORS middleware
 	handler := enableCors(mux)
@@ -179,78 +189,181 @@ func main() {
 	}
 }
 
-// Handle activation claim requests from clients (management console)
-func (s *Server) handleActivationClaim(w http.ResponseWriter, r *http.Request) {
-	activationCode := r.URL.Query().Get("activationCode")
-	accountID := r.URL.Query().Get("accountID")
-	friendlyName := r.URL.Query().Get("friendlyName") // Friendly name parameter
-
-	log.Println("handleActivationClaim activation code: " + activationCode + " accountID: " + accountID + " friendlyName: " + friendlyName)
-
-	if activationCode == "" || accountID == "" {
-		http.Error(w, "Missing activationCode or accountID parameter", http.StatusBadRequest)
+func (s *Server) handleDeactivateRedisServer(w http.ResponseWriter, r *http.Request) {
+	redisServerID := r.URL.Query().Get("redisServerId")
+	if redisServerID == "" {
+		http.Error(w, "Missing redisServerID parameter", http.StatusBadRequest)
 		return
 	}
 
-	// Check if the activation code is pending
-	redisServerID, err := s.rdb.Get(s.ctx, "pendingActivation:"+activationCode).Result()
-	if err == redis.Nil {
-		// Activation code not found or already claimed
-		http.Error(w, "Invalid or already claimed activation code", http.StatusNotFound)
-		return
-	} else if err != nil {
-		log.Println("Error checking pending activation:", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	// Remove the pending activation
-	err = s.rdb.Del(s.ctx, "pendingActivation:"+activationCode).Err()
+	// Read the server info
+	serverInfo, err := s.readServerInfo(redisServerID)
 	if err != nil {
-		log.Println("Error deleting pending activation:", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		http.Error(w, "Redis server not found", http.StatusNotFound)
 		return
 	}
 
-	// Remove the activation code associated with the UUID
-	err = s.rdb.Del(s.ctx, "redis_server_id:"+redisServerID+":activation_code").Err()
+	// Set the activation state to DEACTIVATED
+	serverInfo.ActivationState = ActivationStateDeactivated
+
+	// Update the server info in Redis
+	err = s.writeServerInfo(redisServerID, serverInfo)
 	if err != nil {
-		log.Println("Error deleting activation code for redis_server_id:", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		http.Error(w, "Failed to update server info", http.StatusInternalServerError)
 		return
 	}
 
-	// Create the ServerInfo object
-	redisServerInfo := RedisServerInfo{
-		AccountID:    accountID,
-		FriendlyName: friendlyName,
-		Status:       "RUNNING",
-		Timestamp:    time.Now().Unix(),
+	// Remove the association between the agentID and the redisServerID
+	agentID, err := s.getAgentIDForRedisServerID(redisServerID)
+	if err != nil {
+		// No agent found, proceed
+	} else {
+		// Send control message to the agent to stop managing this redisServerID
+		controlMsg := map[string]interface{}{
+			"message_type":    "__deactivate_redis_server__",
+			"redis_server_id": redisServerID,
+		}
+		err = s.sendControlMessage(agentID, controlMsg)
+		if err != nil {
+			log.Println("Error sending control message to agent:", err)
+		}
+
+		// Remove the mapping in Redis
+		err = s.rdb.SRem(s.ctx, "agentIDToRedisServerIDs:"+agentID, redisServerID).Err()
+		if err != nil {
+			log.Println("Error removing redisServerID from agentIDToRedisServerIDs:", err)
+		}
+		err = s.rdb.Del(s.ctx, "redisServerIDToAgentID:"+redisServerID).Err()
+		if err != nil {
+			log.Println("Error deleting redisServerIDToAgentID mapping:", err)
+		}
 	}
 
+	// Remove redisServerID from accountServers
+	accountID := serverInfo.AccountID
+	if accountID != "" {
+		err = s.rdb.SRem(s.ctx, "accountServers:"+accountID, redisServerID).Err()
+		if err != nil {
+			log.Println("Error removing redisServerID from accountServers:", err)
+		}
+	}
+
+	// Delete the server info from Redis
+	err = s.rdb.Del(s.ctx, "redis_server_id:"+redisServerID).Err()
+	if err != nil {
+		log.Println("Error deleting server info from Redis:", err)
+	}
+
+	// Delete the heartbeat stream
+	streamKey := fmt.Sprintf("redis_server_id:%s:heartbeat_stream", redisServerID)
+	err = s.rdb.Del(s.ctx, streamKey).Err()
+	if err != nil {
+		log.Println("Error deleting heartbeat stream from Redis:", err)
+	}
+
+	// Respond success
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Redis server deactivated and removed successfully"))
+}
+
+func (s *Server) readServerInfo(redisServerID string) (RedisServerInfo, error) {
+	serverInfoData, err := s.rdb.Do(s.ctx, "JSON.GET", "redis_server_id:"+redisServerID).Result()
+	
+	if err != nil {
+		return RedisServerInfo{}, fmt.Errorf("error getting server info for redisServerID: %s, error: %v", redisServerID, err)
+	}
+
+	// Convert the result to a string or byte slice
+	var serverInfo RedisServerInfo
+	switch data := serverInfoData.(type) {
+	case string:
+		err = json.Unmarshal([]byte(data), &serverInfo)
+	case []byte:
+		err = json.Unmarshal(data, &serverInfo)
+	default:
+		return RedisServerInfo{}, fmt.Errorf("unexpected data type for server info: %T", serverInfoData)
+	}
+
+	if err != nil {
+		return RedisServerInfo{}, fmt.Errorf("error unmarshaling server info for redisServerID: %s, error: %v", redisServerID, err)
+	}
+
+	return serverInfo, nil
+}
+
+func (s *Server) writeServerInfo(redisServerID string, serverInfo RedisServerInfo) error {
 	// Store the redisServerInfo as a JSON object in Redis
-	redisServerInfoJSON, err := json.Marshal(redisServerInfo)
+	redisServerInfoJSON, err := json.Marshal(serverInfo)
 	if err != nil {
 		log.Println("Error marshaling server info:", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
+		return err
 	}
 
 	// Use JSON.SET command to store the JSON object
 	_, err = s.rdb.Do(s.ctx, "JSON.SET", "redis_server_id:"+redisServerID, ".", redisServerInfoJSON).Result()
 	if err != nil {
 		log.Println("Error setting server info in Redis:", err)
+		return err
+	}
+	return nil
+}
+	
+
+// Handle activation claim requests from clients (management console)
+func (s *Server) handleActivationClaim(w http.ResponseWriter, r *http.Request) {
+	activationCode := r.URL.Query().Get("activationCode")
+	accountID := r.URL.Query().Get("accountID")
+
+	log.Println("handleActivationClaim activation code: " + activationCode + " accountID: " + accountID)
+
+	if activationCode == "" || accountID == "" {
+		http.Error(w, "Missing activationCode or accountID parameter", http.StatusBadRequest)
+		return
+	}
+
+	redisServerID, err := s.claimActivationCode(activationCode)
+	if err != nil {
+		log.Println("Error claiming activation code:", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Add UUID to the set of servers for the accountID
+	// Create the ServerInfo object
+	redisServerInfo := RedisServerInfo{
+		AccountID: accountID,
+		Status:    "RUNNING",
+		Timestamp: time.Now().Unix(),
+		ActivationState: ActivationStateActivated,
+		RedisServerID:   redisServerID,
+	}
+
+	err = s.writeServerInfo(redisServerID, redisServerInfo)
+	if err != nil {
+		log.Println("Error writing server info:", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Add redisServerID to the set of servers for the accountID
 	err = s.rdb.SAdd(s.ctx, "accountServers:"+accountID, redisServerID).Err()
 	if err != nil {
 		log.Println("Error adding UUID to accountServers:", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+
+	// Inform the agent that the server is activated - send a control message "__activation_complete__"
+	controlMsg := map[string]interface{}{
+		"message_type":    "__activation_claimed__",
+		"redis_server_id": redisServerID,
+	}
+	agentID, err := s.getAgentIDForRedisServerID(redisServerID)
+	if err != nil {
+		log.Printf("Error retrieving agentID for redisServerID %s: %v", redisServerID, err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	s.sendControlMessage(agentID, controlMsg)
 
 	// Respond with success
 	log.Println("handleActivationClaim success")
@@ -307,40 +420,17 @@ func (s *Server) handleGetServers(w http.ResponseWriter, r *http.Request) {
 	// For each UUID, retrieve the serverInfo JSON object
 	for _, uuid := range uuids {
 		// Get the JSON data from Redis
-		serverInfoData, err := s.rdb.Do(s.ctx, "JSON.GET", "uuid:"+uuid).Result()
-		if err == redis.Nil {
-			// Server info not found
-			log.Println("Server info not found for UUID:", uuid)
-			continue
-		} else if err != nil {
-			log.Println("Error getting server info for UUID:", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		// Parse the JSON data
-		var serverInfo RedisServerInfo
-		switch data := serverInfoData.(type) {
-		case string:
-			err = json.Unmarshal([]byte(data), &serverInfo)
-		case []byte:
-			err = json.Unmarshal(data, &serverInfo)
-		default:
-			log.Println("Unknown data type for server info:", reflect.TypeOf(serverInfoData))
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
+		serverInfoData, err := s.readServerInfo(uuid)
 
 		if err != nil {
-			log.Println("Error unmarshaling server info for UUID:", uuid, err)
+			log.Println("Error getting server info for UUID:", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 
 		// Append server info to the list
 		servers = append(servers, map[string]string{
-			"uuid":         uuid,
-			"friendlyName": serverInfo.FriendlyName,
+			"uuid": serverInfoData.RedisServerID,
 		})
 	}
 
@@ -353,25 +443,44 @@ func (s *Server) handleGetServers(w http.ResponseWriter, r *http.Request) {
 
 // Handle retrieval of servers associated with a databaseID
 func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
-	redisServerId := r.URL.Query().Get("id")
-	if redisServerId == "" {
-		http.Error(w, "Missing redisServerId parameter", http.StatusBadRequest)
-		return
-	}
+    redisServerId := r.URL.Query().Get("id")
+    if redisServerId == "" {
+        http.Error(w, "Missing redisServerId parameter", http.StatusBadRequest)
+        return
+    }
 
-	// Get the stats for the redisServerId
-	stats, err := s.rdb.Do(s.ctx, "JSON.GET", "redis_server_id:"+redisServerId+":heartbeat_latest").Result()
-	if err != nil {
-		log.Println("Error getting stats for redisServerId: %s, Error: %v", redisServerId, err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
+    // Construct the stream key
+    streamKey := fmt.Sprintf("redis_server_id:%s:heartbeat_stream", redisServerId)
 
-	// return stats to client
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(stats)
+    // Read the latest entry from the stream using XRevRangeN
+    streamEntries, err := s.rdb.XRevRangeN(s.ctx, streamKey, "+", "-", 1).Result()
+    if err != nil {
+        log.Printf("Error reading from stream for redisServerId %s: %v", redisServerId, err)
+        http.Error(w, "Internal server error", http.StatusInternalServerError)
+        return
+    }
+
+    // Check if there are any entries
+    if len(streamEntries) == 0 {
+        http.Error(w, "No entries in the stream", http.StatusNotFound)
+        return
+    }
+
+    // Get the latest entry
+    entry := streamEntries[0]
+
+    // Convert the response map to JSON
+    statsJSON, err := json.Marshal(entry.Values)
+    if err != nil {
+        log.Printf("Error marshaling stats: %v", err)
+        http.Error(w, "Internal server error", http.StatusInternalServerError)
+        return
+    }
+	
+    // Set the content type and write the JSON response
+    w.Header().Set("Content-Type", "application/json")
+    w.Write(statsJSON)
 }
-
 // handleAgentConnection handles WebSocket connections from agents
 func (s *Server) handleAgentConnection(w http.ResponseWriter, r *http.Request) {
 	log.Println("Received a new agent connection request")
@@ -504,9 +613,9 @@ func (agent *Agent) handleControlMessage(data []byte) error {
 	}
 
 	switch msgType {
-	case "__activation__":
+	case "__activation_request__":
 		// Handle activation
-		return agent.server.handleActivation(agent.agentID, controlMsg)
+		return agent.server.handleActivationRequest(agent.agentID, controlMsg)
 	case "__agent_managed_redis_server__":
 		return agent.server.handleAgentManagedRedisServer(controlMsg, agent.agentID)
 	case "__redis_server_heartbeat__":
@@ -520,6 +629,13 @@ func (s *Server) handleRedisServerHeartbeat(controlMsg map[string]interface{}, a
 	redisServerID, ok := controlMsg["redis_server_id"].(string)
 	if !ok {
 		return fmt.Errorf("control message missing 'redis_server_id' field")
+	}
+
+	// only update and store heartbeat data if the server is claimed by an agent
+	_, err := s.getAgentIDForRedisServerID(redisServerID)
+	if err != nil {
+		log.Printf("Server is not activated %s - discarding heartbeat", redisServerID)
+		return err
 	}
 
 	status, ok := controlMsg["status"].(string)
@@ -552,7 +668,7 @@ func (s *Server) handleRedisServerHeartbeat(controlMsg map[string]interface{}, a
 
 	// Store in Redis Stream
 	streamKey := fmt.Sprintf("redis_server_id:%s:heartbeat_stream", redisServerID)
-	_, err := s.rdb.XAdd(s.ctx, &redis.XAddArgs{
+	_, err = s.rdb.XAdd(s.ctx, &redis.XAddArgs{
 		Stream: streamKey,
 		MaxLen: 1000,
 		Approx: true,
@@ -563,38 +679,40 @@ func (s *Server) handleRedisServerHeartbeat(controlMsg map[string]interface{}, a
 		return err
 	}
 
-	// Store the status and timestamp to the serverInfo 
-	serverInfoKey := fmt.Sprintf("redis_server_id:%s", redisServerID) 
+	// Store the status and timestamp to the serverInfo
+	serverInfoKey := fmt.Sprintf("redis_server_id:%s", redisServerID)
 
-	_, err = s.rdb.Do(s.ctx, "JSON.SET", serverInfoKey, "$.timestamp", time.Now().Unix()).Result()
-	if err != nil {
-		log.Printf("Error storing timestamp to serverInfo JSON: %v", err)
-		return err
+	if s.rdb.Exists(s.ctx, serverInfoKey).Val() == 1 {
+		_, err = s.rdb.Do(s.ctx, "JSON.SET", serverInfoKey, "$.timestamp", time.Now().Unix()).Result()
+		if err != nil {
+			log.Printf("Error storing timestamp to serverInfo JSON: %v", err)
+			return err
+		}
+		statusString := fmt.Sprintf("\"%s\"", status)
+		_, err = s.rdb.Do(s.ctx, "JSON.SET", serverInfoKey, "$.status", statusString).Result()
+		if err != nil {
+			log.Printf("Error storing status to serverInfo JSON: %v", err)
+			return err
+		}
 	}
-	statusString := fmt.Sprintf("\"%s\"", status)
-	_, err = s.rdb.Do(s.ctx, "JSON.SET", serverInfoKey, "$.status", statusString).Result()
-	if err != nil {
-		log.Printf("Error storing status to serverInfo JSON: %v", err)
-		return err
-	}
-	
+
 	// Store the latest stats as JSON for quick access
-	jsonKey := fmt.Sprintf("redis_server_id:%s:heartbeat_latest", redisServerID)
-	stats["timestamp"] = time.Now().Unix()
-	statsJSONBytes, err := json.Marshal(stats)
-	if err != nil {
-		log.Printf("Error marshaling latest heartbeat stats: %v", err)
-		return err
-	}
+	// jsonKey := fmt.Sprintf("redis_server_id:%s:heartbeat_latest", redisServerID)
+	// stats["timestamp"] = time.Now().Unix()
+	// statsJSONBytes, err := json.Marshal(stats)
+	// if err != nil {
+	// 	log.Printf("Error marshaling latest heartbeat stats: %v", err)
+	// 	return err
+	// }
 
 	// Use JSON.SET command to store the JSON object
-	_, err = s.rdb.Do(s.ctx, "JSON.SET", jsonKey, ".", statsJSONBytes).Result()
-	if err != nil {
-		log.Printf("Error storing latest heartbeat stats as JSON: %v", err)
-		return err
-	}
+	// _, err = s.rdb.Do(s.ctx, "JSON.SET", jsonKey, ".", statsJSONBytes).Result()
+	// if err != nil {
+	// 	log.Printf("Error storing latest heartbeat stats as JSON: %v", err)
+	// 	return err
+	// }
 
-	log.Printf("Heartbeat for redisServerID %s - Server is %s", redisServerID, status)
+	//log.Printf("Heartbeat for redisServerID %s - Server is %s", redisServerID, status)
 	return nil
 }
 
@@ -608,99 +726,156 @@ func (s *Server) handleAgentManagedRedisServer(controlMsg map[string]interface{}
 	return s.associateAgentWithRedisServerID(agentID, redisServerID)
 }
 
-func (s *Server) handleActivation(agentID string, controlMsg map[string]interface{}) error {
-	// Extract the UUID of the activating client
+func (s *Server) handleActivationRequest(agentID string, controlMsg map[string]interface{}) error {
+	// Extract the UUID of the registering server
 	redisServerID, ok := controlMsg["redis_server_id"].(string)
 	if !ok {
-		return fmt.Errorf("activation message missing 'redis_server_uuid' field")
+		return fmt.Errorf("activation request message missing 'redis_server_uuid' field")
+	}
+
+	// First Store the association of agentID and redisServerID
+	// TODO: Should we do this under a separate location?
+	err := s.associateAgentWithRedisServerID(agentID, redisServerID)
+	if err != nil {
+		log.Printf("Error associating agent with redisServerID %s: %v", redisServerID, err)
+		return err
 	}
 
 	// Extract `request_id` from the control message
 	requestID, ok := controlMsg["request_id"].(string)
 	if !ok {
-		return fmt.Errorf("activation message missing 'request_id' field")
+		return fmt.Errorf("activation request message missing 'request_id' field")
 	}
 
-	// Implement the activation logic here
-	log.Printf("Activating agent %s for redis server ID: %s", agentID, redisServerID)
+	// Attempt to retrieve existing RedisServerInfo
+	serverInfo, err := s.readServerInfo(redisServerID)
 
-	// Perform any necessary activation logic
-	// Check if the UUID is already registered (claimed)
-	serverInfoData, err := s.rdb.Do(s.ctx, "JSON.GET", "redis_server_id:"+redisServerID).Result()
-	if err == redis.Nil {
-		// UUID not registered
-		log.Println("UUID not registered:", redisServerID)
-
-		// Check for existing activation code
-		activationCode, err := s.rdb.Get(s.ctx, "redis_server_id:"+redisServerID+":activation_code").Result()
-		if err == redis.Nil {
-			// No activation code exists, generate and store one
-			activationCode, err := s.generateActivationCode()
-			if err != nil {
-				log.Println("Error generating activation code:", err)
-				return err
-			}
-
-			// Store the activation code associated with the UUID
-			err = s.rdb.Set(s.ctx, "redis_server_id:"+redisServerID+":activation_code", activationCode, 24*time.Hour).Err()
-			if err != nil {
-				log.Println("Error storing activation code for redis_server_id:", err)
-				return err
-			}
-
-			// Map the activation code to the UUID for pending activation
-			err = s.rdb.Set(s.ctx, "pendingActivation:"+activationCode, redisServerID, 24*time.Hour).Err()
-			if err != nil {
-				log.Println("Error storing pending activation:", err)
-				return err
-			}
-
-			// Send activation code back to agent
-			responseData := map[string]string{
-				"activation_code": activationCode,
-			}
-			return s.sendActivationResponse(agentID, requestID, responseData)
-		} else if err != nil {
-			log.Println("Error checking activation code for redis_server_id:", err)
-			return err
-		} else {
-			// After activation is successful, store the mapping
-			// Activation code exists, send it back to the agent
-			responseData := map[string]string{
-				"activation_code": activationCode,
-			}
-			return s.sendActivationResponse(agentID, requestID, responseData)
-		}
-	} else if err != nil {
-		log.Println("Error retrieving server info for redis_server_id:", err)
-		return err
-	} else {
-		// UUID is registered, parse the ServerInfo
-		var serverInfo RedisServerInfo
-		switch data := serverInfoData.(type) {
-		case string:
-			err = json.Unmarshal([]byte(data), &serverInfo)
-		case []byte:
-			err = json.Unmarshal(data, &serverInfo)
-		default:
-			log.Println("Unknown data type for server info:", reflect.TypeOf(serverInfoData))
-			return fmt.Errorf("unknown data type for server info")
-		}
+	if err != nil {
+		// No existing server info, create new with ActivationStatePending
+		activationCode, err := s.getActivationCode(redisServerID)
 
 		if err != nil {
-			log.Println("Error unmarshaling server info for redis_server_id:", redisServerID, err)
-			return err
+			return fmt.Errorf("error generating activation code: %v", err)
 		}
 
-		// Send activated response
-		log.Printf("Account ID found for redis_server_id: %s: %s", redisServerID, serverInfo.AccountID)
-		responseData := map[string]bool{
-			"activated": true,
+		serverInfo = RedisServerInfo{
+			RedisServerID:   redisServerID,
+			AgentID:         agentID,
+			AccountID:       "",
+			Status:          "RUNNING",
+			Timestamp:       time.Now().Unix(),
+			ActivationState: ActivationStatePending,
 		}
+
+		// Store the new RedisServerInfo
+		err = s.writeServerInfo(redisServerID, serverInfo)
+		if err != nil {
+			return fmt.Errorf("error setting server info: %v", err)
+		}
+
+		// Send activation code to the agent
+		// send status = "new_server" and activation_code
+		responseData := map[string]string{"state": ActivationStatePending, "activation_code": activationCode}
 
 		return s.sendActivationResponse(agentID, requestID, responseData)
+
+	} else {
+
+		// Handle based on the current activation state
+		switch serverInfo.ActivationState {
+		case ActivationStatePending:
+
+			// Send existing activation code to the agent
+			activationCode, err := s.getActivationCode(redisServerID)
+
+			if err == nil {
+				responseData := map[string]string{"activation_code": activationCode}
+				return s.sendActivationResponse(agentID, requestID, responseData)
+			} else {
+				return fmt.Errorf("error retrieving activation code: %v", err)
+			}
+
+		case ActivationStateActivated:
+			responseData := map[string]bool{"activated": true}
+			return s.sendActivationResponse(agentID, requestID, responseData)
+
+		case ActivationStateDeactivated:
+			responseData := map[string]bool{"activated": false}
+			return s.sendActivationResponse(agentID, requestID, responseData)
+
+		default:
+			return fmt.Errorf("unknown activation state: %s", serverInfo.ActivationState)
+		}
 	}
 
+}
+
+func (s *Server) claimActivationCode(activationCode string) (string, error) {
+
+	// Check if the activation code is pending
+	redisServerID, err := s.rdb.Get(s.ctx, "activation_code:"+activationCode).Result()
+	if err == redis.Nil {
+		// Activation code not found or already claimed
+		return "", fmt.Errorf("invalid or already claimed activation code")
+		//http.Error(w, "Invalid or already claimed activation code", http.StatusNotFound)
+		
+	} else if err != nil {
+		log.Println("Error checking pending activation:", err)
+		return "", fmt.Errorf("internal server error", err)
+		//http.Error(w, "Internal server error", http.StatusInternalServerError)
+		
+	}
+
+	// Remove the pending activation
+	err = s.rdb.Del(s.ctx, "activation_code:"+activationCode).Err()
+	if err != nil {
+		log.Println("Error deleting pending activation:", err)
+		return "", fmt.Errorf("internal server error", err)
+		//http.Error(w, "Internal server error", http.StatusInternalServerError)
+		
+	}
+
+	// Remove the server_id mapping
+	err = s.rdb.Del(s.ctx, "redis_server_id:"+redisServerID+":activation_code").Err()
+	if err != nil {
+		log.Println("Error deleting activation code for redis_server_id:", err)
+		return "", fmt.Errorf("internal server error", err)
+		//http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
+
+	return redisServerID, nil
+}
+
+// getActivationCode retrieves the activation code for a given redisServerID or generates a new one if not found
+func (s *Server) getActivationCode(redisServerID string) (string, error) {
+	activationCodeKey := "activation_code:"
+
+	// Check if the activation code is already stored/pending and return that
+	activationCode, err := s.rdb.Get(s.ctx, "redis_server_id:"+redisServerID+":activation_code").Result()
+	if err == nil {
+		return activationCode, nil
+	}
+
+	// Generate a new activation code if not found
+	activationCode, err = s.generateActivationCode()
+
+	if err != nil {
+		return "", fmt.Errorf("error generating activation code: %v", err)
+	}
+
+	// Store the new activation code
+	err = s.rdb.Set(s.ctx, "redis_server_id:"+redisServerID+":activation_code", activationCode, 24*time.Hour).Err()
+	if err != nil {
+		return "", fmt.Errorf("error storing activation code: %v", err)
+	}
+
+	// Store activation code with expiration
+	err = s.rdb.Set(s.ctx, activationCodeKey+activationCode, redisServerID, 24*time.Hour).Err()
+	if err != nil {
+		return "", fmt.Errorf("error storing activation code: %v", err)
+	}
+
+	return activationCode, nil
 }
 
 func (s *Server) sendActivationResponse(agentID, requestID string, responseData interface{}) error {

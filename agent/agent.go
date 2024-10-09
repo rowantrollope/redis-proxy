@@ -226,11 +226,9 @@ func activateHandler(w http.ResponseWriter, r *http.Request, requestManager *Req
 		// Handle error appropriately
 	}
 
-	// Start a heartbeat for the new Redis server
-	agent.startHeartbeat(req.UUID, clientManager)
-
 	// Generate a unique request ID
 	requestID := uuid.New().String()
+	redisServerID := req.UUID 
 
 	// Create a response channel and store it in the pending requests map
 	respChan := make(chan []byte)
@@ -240,8 +238,8 @@ func activateHandler(w http.ResponseWriter, r *http.Request, requestManager *Req
 
 	// Create the activation control message
 	controlMsg := map[string]interface{}{
-		"message_type":    "__activation__",
-		"redis_server_id": req.UUID,
+		"message_type":    "__activation_request__",
+		"redis_server_id": redisServerID,
 		"request_id":      requestID,
 	}
 	controlMsgBytes, err := json.Marshal(controlMsg)
@@ -258,6 +256,9 @@ func activateHandler(w http.ResponseWriter, r *http.Request, requestManager *Req
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+
+	// Start a heartbeat for the new Redis server
+	agent.startHeartbeat(redisServerID, clientManager)
 
 	// Wait for the server's response or timeout
 	select {
@@ -382,6 +383,10 @@ func handleControlMessage(data []byte, requestManager *RequestManager, clientMan
 	case "__activation_response__":
 		// Handle the activation response
 		return handleActivationResponse(controlMsg, requestManager)
+	case "__activation_claimed__":
+		return handleActivationComplete(controlMsg, clientManager, agent)
+	case "__deactivate_redis_server__":
+		return handleDeactivateRedisServer(controlMsg, clientManager, agent)
 	case "__client_connected__":
 		return handleClientConnected(controlMsg, clientManager, agent)
 	case "__client_disconnect__":
@@ -390,6 +395,60 @@ func handleControlMessage(data []byte, requestManager *RequestManager, clientMan
 	default:
 		return fmt.Errorf("unknown control message_type: %s", messageType)
 	}
+}
+
+func handleDeactivateRedisServer(controlMsg map[string]interface{}, clientManager *ClientManager, agent *Agent) error {
+	// Extract redis_server_id from control message
+	redisServerID, ok := controlMsg["redis_server_id"].(string)
+	if !ok {
+		return fmt.Errorf("deactivate redis server message missing 'redis_server_id' field or it is not a string")
+	}
+
+	log.Printf("Received request to deactivate Redis server ID: %s", redisServerID)
+
+	// Stop the heartbeat for the redisServerID
+	agent.stopHeartbeat(redisServerID)
+
+	// Remove the Redis server details from the clientManager
+	clientManager.redisServerDetailsMutex.Lock()
+	delete(clientManager.redisServerDetailsMap, redisServerID)
+	clientManager.redisServerDetailsMutex.Unlock()
+
+	// Save the updated Redis server details to disk
+	err := saveRedisServerDetails(clientManager.redisServerDetailsMap)
+	if err != nil {
+		log.Printf("Error saving Redis server details after deactivation: %v", err)
+	}
+
+	// Disconnect any clients associated with this redisServerID
+	clientManager.disconnectClientsForRedisServerID(redisServerID)
+
+	return nil
+}
+
+func (cm *ClientManager) disconnectClientsForRedisServerID(redisServerID string) {
+	cm.clientsMutex.Lock()
+	defer cm.clientsMutex.Unlock()
+	for clientID, client := range cm.clients {
+		cm.clientRedisServerIDMutex.Lock()
+		clientRedisServerID, exists := cm.clientRedisServerIDMap[clientID]
+		cm.clientRedisServerIDMutex.Unlock()
+
+		if exists && clientRedisServerID == redisServerID {
+			client.cleanup()
+		}
+	}
+}
+func handleActivationComplete(controlMsg map[string]interface{}, clientManager *ClientManager, agent *Agent) error {
+	// Extract redis_server_id from control message
+	_, ok := controlMsg["redis_server_id"].(string)
+	if !ok {
+		return fmt.Errorf("activation complete message missing 'redis_server_id' field or it is not a string")
+	}
+	
+	log.Printf("Activation complete for Redis server ID: %s", controlMsg["redis_server_id"])
+	
+	return nil
 }
 
 // handleActivationResponse handles the activation response from the server
@@ -612,7 +671,7 @@ func (agent *Agent) reconnectToServer() {
 		time.Sleep(5 * time.Second)
 		log.Println("Attempting to reconnect to server...")
 		wsConn, err := connectToServer(uuid.New().String())
-		if err != nil {
+		if err != nil { 
 			log.Printf("Reconnect failed: %v", err)
 			continue
 		}
@@ -691,6 +750,11 @@ func (client *RedisClient) cleanup() {
 		client.clientManager.clientsMutex.Lock()
 		delete(client.clientManager.clients, client.ClientID)
 		client.clientManager.clientsMutex.Unlock()
+
+		// Remove the clientID mapping from clientRedisServerIDMap
+		client.clientManager.clientRedisServerIDMutex.Lock()
+		delete(client.clientManager.clientRedisServerIDMap, client.ClientID)
+		client.clientManager.clientRedisServerIDMutex.Unlock()
 
 		log.Printf("Cleaned up Redis client for ClientID %d", client.ClientID)
 	})
@@ -788,11 +852,30 @@ func (agent *Agent) performHeartbeat(redisServerID string, clientManager *Client
 		return
 	}
 
+	// Collect system stats
+    systemStats := make(map[string]interface{})
+
+    // Get hostname
+    hostname, err := os.Hostname()
+    if err != nil {
+        hostname = "unknown"
+    }
+    systemStats["hostname"] = hostname
+
+    // Get IP addresses
+    ips, err := getLocalIPAddresses()
+    if err != nil {
+        ips = []string{}
+    }
+    systemStats["ip_addresses"] = ips
+
+
 	// Try to connect to the Redis server
 	address := net.JoinHostPort(redisDetails.Host, redisDetails.Port)
 	conn, err := net.DialTimeout("tcp", address, 5*time.Second)
 	status := "OFFLINE"
-	stats := ""
+	stats := "{}"
+
 	timestamp := time.Now().Unix()
 	if err == nil {
 		defer conn.Close()
@@ -862,6 +945,7 @@ func (agent *Agent) performHeartbeat(redisServerID string, clientManager *Client
 		"status":          status,
 		"timestamp":       timestamp,
 		"redis_stats":     stats,
+		"system_stats":    systemStats,
 	}
 	controlMsgBytes, err := json.Marshal(controlMsg)
 	if err != nil {
@@ -874,7 +958,6 @@ func (agent *Agent) performHeartbeat(redisServerID string, clientManager *Client
 	if err != nil {
 		log.Printf("Error sending heartbeat control message for Redis server %s: %v", redisServerID, err)
 	}
-	log.Printf("Sent heartbeat control message for Redis server %s: %s", redisServerID, status)
 }
 
 // stopHeartbeat stops the heartbeat for a specific Redis server
@@ -887,6 +970,34 @@ func (agent *Agent) stopHeartbeat(redisServerID string) {
 	}
 }
 
+// getLocalIPAddresses retrieves the non-loopback IP addresses of the host
+func getLocalIPAddresses() ([]string, error) {
+    var ips []string
+    interfaces, err := net.Interfaces()
+    if err != nil {
+        return nil, err
+    }
+    for _, i := range interfaces {
+        addrs, err := i.Addrs()
+        if err != nil {
+            continue
+        }
+        for _, addr := range addrs {
+            var ip net.IP
+            switch v := addr.(type) {
+            case *net.IPNet:
+                ip = v.IP
+            case *net.IPAddr:
+                ip = v.IP
+            }
+            if ip == nil || ip.IsLoopback() {
+                continue
+            }
+            ips = append(ips, ip.String())
+        }
+    }
+    return ips, nil
+}
 // readBulkString reads a bulk string from the Redis server
 func readBulkString(reader *bufio.Reader) (string, error) {
 	// Read the first line, which contains the '$' and length
