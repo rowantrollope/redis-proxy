@@ -4,11 +4,5 @@
     "Port": "6379",
     "Username": "",
     "Password": "foobared"
-  },
-  "F83D7D6A-C2E1-47D4-8C52-4628A57CC34E": {
-    "Host": "127.0.0.1",
-    "Port": "6380",
-    "Username": "",
-    "Password": "foobared"
   }
 }

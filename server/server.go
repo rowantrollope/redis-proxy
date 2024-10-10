@@ -2,18 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/json"
+	"fmt"
+	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
-	"crypto/rand"
-	"math/big"
-	"fmt"
-	"encoding/json"
-	"io"
-	
+
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
 )
@@ -34,6 +34,8 @@ type Server struct {
 
 	activeClients      map[string]int
 	activeClientsMutex sync.Mutex
+
+	reconnectedAgents *sync.Map // Map to track reconnected agents
 }
 
 // NewServer initializes a new Server instance
@@ -68,16 +70,58 @@ func (s *Server) Start() {
 	// Wrap the mux with the CORS middleware
 	handler := enableCors(mux)
 
+	// After a timeout reconnection checks
+	go s.checkAgentReconnections()
+
 	// Start the HTTP server with the handler
 	log.Printf("Server listening on :%d for agents and API requests", s.port)
 	if err := http.ListenAndServe(fmt.Sprintf(":%d", s.port), handler); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
+	}
+
+}
+
+// checkAgentReconnections checks for agent reconnections upon server startup
+func (s *Server) checkAgentReconnections() {
+	// Define the timeout duration for agents to reconnect
+	const reconnectionTimeout = 30 * time.Second
+
+	// Retrieve all known agent IDs
+	agentIDs, err := s.getAllKnownAgentIDs()
+	if err != nil {
+		log.Printf("Error retrieving known agent IDs: %v", err)
+		return
+	}
+
+	// Map to track whether agents have reconnected
+	s.reconnectedAgents = &sync.Map{}
+
+	// For each agent ID, start a timer to wait for reconnection
+	for _, agentID := range agentIDs {
+		go func(agentID string) {
+			timer := time.NewTimer(reconnectionTimeout)
+			select {
+			case <-timer.C:
+				// Timer expired, check if agent has reconnected
+				if _, ok := s.LoadAgent(agentID); !ok {
+					// Agent has not reconnected, mark associated Redis servers as "AGENT_UNREACHABLE"
+					log.Printf("Agent %s did not reconnect within the timeout period", agentID)
+					s.handleAgentDisconnect(agentID)
+				} else {
+					log.Printf("Agent %s reconnected", agentID)
+				}
+			}
+		}(agentID)
 	}
 }
 
 // StoreAgent stores the agent instance
 func (s *Server) StoreAgent(agentID string, agent *Agent) {
 	s.agents.Store(agentID, agent)
+}
+
+func (s *Server) RemoveAgent(agentID string) {
+	s.agents.Delete(agentID)
 }
 
 // LoadAgent retrieves the agent instance
@@ -113,21 +157,21 @@ func (s *Server) decrementClientCounter(redisServerID string) {
 
 // generateActivationCode generates a cryptographically secure activation code
 func (server *Server) generateActivationCode() (string, error) {
-    // I and O are removed to avoid confusion with 1 and 0
-    const charset = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789"
-    code := make([]byte, 8) // 8 characters (without the dash)
+	// I and O are removed to avoid confusion with 1 and 0
+	const charset = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789"
+	code := make([]byte, 8) // 8 characters (without the dash)
 
-    for i := range code {
-        num, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
-        if err != nil {
-            return "", err
-        }
-        code[i] = charset[num.Int64()]
-    }
+	for i := range code {
+		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		if err != nil {
+			return "", err
+		}
+		code[i] = charset[num.Int64()]
+	}
 
-    // Insert the dash in the middle
-    activationCode := fmt.Sprintf("%s-%s", string(code[:4]), string(code[4:]))
-    return activationCode, nil
+	// Insert the dash in the middle
+	activationCode := fmt.Sprintf("%s-%s", string(code[:4]), string(code[4:]))
+	return activationCode, nil
 }
 
 // closeListenerIfNoClients checks if there are no active clients for the given redisServerID
@@ -284,21 +328,23 @@ func (s *Server) handleRedisServerHeartbeat(controlMsg map[string]interface{}, a
 		flatStats[k] = fmt.Sprint(v)
 	}
 
-	// Add status and timestamp to the stats
-	flatStats["status"] = status
-	flatStats["timestamp"] = time.Now().Unix()
+	if status == "RUNNING" {
+		// Add status and timestamp to the stats
+		flatStats["status"] = status
+		flatStats["timestamp"] = time.Now().Unix()
 
-	// Store in Redis Stream
-	streamKey := fmt.Sprintf("redis_server_id:%s:heartbeat_stream", redisServerID)
-	_, err = s.rdb.XAdd(s.ctx, &redis.XAddArgs{
-		Stream: streamKey,
-		MaxLen: 1000,
-		Approx: true,
-		Values: flatStats,
-	}).Result()
-	if err != nil {
-		log.Printf("Error adding heartbeat to stream: %v", err)
-		return err
+		// Store in Redis Stream
+		streamKey := fmt.Sprintf("redis_server_id:%s:heartbeat_stream", redisServerID)
+		_, err = s.rdb.XAdd(s.ctx, &redis.XAddArgs{
+			Stream: streamKey,
+			MaxLen: 1000,
+			Approx: true,
+			Values: flatStats,
+		}).Result()
+		if err != nil {
+			log.Printf("Error adding heartbeat to stream: %v", err)
+			return err
+		}
 	}
 
 	// Store the status and timestamp to the serverInfo
@@ -318,23 +364,6 @@ func (s *Server) handleRedisServerHeartbeat(controlMsg map[string]interface{}, a
 		}
 	}
 
-	// Store the latest stats as JSON for quick access
-	// jsonKey := fmt.Sprintf("redis_server_id:%s:heartbeat_latest", redisServerID)
-	// stats["timestamp"] = time.Now().Unix()
-	// statsJSONBytes, err := json.Marshal(stats)
-	// if err != nil {
-	// 	log.Printf("Error marshaling latest heartbeat stats: %v", err)
-	// 	return err
-	// }
-
-	// Use JSON.SET command to store the JSON object
-	// _, err = s.rdb.Do(s.ctx, "JSON.SET", jsonKey, ".", statsJSONBytes).Result()
-	// if err != nil {
-	// 	log.Printf("Error storing latest heartbeat stats as JSON: %v", err)
-	// 	return err
-	// }
-
-	//log.Printf("Heartbeat for redisServerID %s - Server is %s", redisServerID, status)
 	return nil
 }
 
@@ -890,10 +919,21 @@ func (s *Server) handleActivationClaim(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// getAllKnownAgentIDs retrieves all known agent IDs from Redis
+func (s *Server) getAllKnownAgentIDs() ([]string, error) {
+	return s.rdb.SMembers(s.ctx, "knownAgentIDs").Result()
+}
+
 // Store mapping from agentID to redisServerID
 func (s *Server) associateAgentWithRedisServerID(agentID, redisServerID string) error {
+	// Add agentID to the set of known agents
+	err := s.rdb.SAdd(s.ctx, "knownAgentIDs", agentID).Err()
+	if err != nil {
+		return err
+	}
+
 	key := "agentIDToRedisServerIDs:" + agentID
-	err := s.rdb.SAdd(s.ctx, key, redisServerID).Err()
+	err = s.rdb.SAdd(s.ctx, key, redisServerID).Err()
 	if err != nil {
 		return err
 	}
@@ -964,6 +1004,14 @@ func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// return the server info for the redisServerId
+	serverInfo, err := s.readServerInfo(redisServerId)
+	if err != nil {
+		log.Printf("Error retrieving server info for redisServerId %s: %v", redisServerId, err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
 	// Construct the stream key
 	streamKey := fmt.Sprintf("redis_server_id:%s:heartbeat_stream", redisServerId)
 
@@ -984,17 +1032,19 @@ func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
 	// Get the latest entry
 	entry := streamEntries[0]
 
-	// Convert the response map to JSON
-	statsJSON, err := json.Marshal(entry.Values)
-	if err != nil {
-		log.Printf("Error marshaling stats: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
+	// Prepare the combined response
+	response := map[string]interface{}{
+		"stats":      entry.Values,
+		"serverInfo": serverInfo,
 	}
 
 	// Set the content type and write the JSON response
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(statsJSON)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Error encoding response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
+
 }
 
 // handleAgentConnection handles WebSocket connections from agents
@@ -1058,4 +1108,44 @@ func (s *Server) handleAgentConnection(w http.ResponseWriter, r *http.Request) {
 
 	// Optionally, send periodic pings
 	go agent.startPing()
+
+	go func() {
+		<-agent.done
+		// Handle agent disconnection
+		s.handleAgentDisconnect(agentID)
+	}()
+}
+
+// handleAgentDisconnect updates the status of all associated Redis servers to "unreachable" when an agent disconnects.
+func (s *Server) handleAgentDisconnect(agentID string) {
+	log.Printf("Agent %s disconnected", agentID)
+
+	// Remove the agent from the server's agents map
+	s.RemoveAgent(agentID)
+
+	// Get the list of redis_server_ids associated with the agent
+	redisServerIDs, err := s.getRedisServerIDsForAgent(agentID)
+	if err != nil {
+		log.Printf("Error getting redis_server_ids for agent %s: %v", agentID, err)
+		return
+	}
+
+	for _, redisServerID := range redisServerIDs {
+		// Update the status of the redis_server to "unreachable" in Redis
+		serverInfoKey := fmt.Sprintf("redis_server_id:%s", redisServerID)
+		statusString := fmt.Sprintf("\"%s\"", "AGENT UNREACHABLE")
+		_, err := s.rdb.Do(s.ctx, "JSON.SET", serverInfoKey, "$.status", statusString).Result()
+		if err != nil {
+			log.Printf("Error setting status to 'unreachable' for redis_server_id %s: %v", redisServerID, err)
+			continue
+		}
+
+		// Update the timestamp
+		_, err = s.rdb.Do(s.ctx, "JSON.SET", serverInfoKey, "$.timestamp", time.Now().Unix()).Result()
+		if err != nil {
+			log.Printf("Error setting timestamp for redis_server_id %s: %v", redisServerID, err)
+			continue
+		}
+		log.Printf("Set status of redis_server_id %s to 'unreachable'", redisServerID)
+	}
 }

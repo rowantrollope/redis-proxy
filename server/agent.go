@@ -83,6 +83,7 @@ func (agent *Agent) writePump() {
 func (agent *Agent) readPump() {
 	defer func() {
 		agent.conn.Close()
+		agent.done <- struct{}{}
 	}()
 	for {
 		_, reader, err := agent.conn.NextReader()
