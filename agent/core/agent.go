@@ -17,7 +17,7 @@ import (
 
 	"github.com/rowantrollope/redis-proxy/agent/redisclient"
 	"github.com/rowantrollope/redis-proxy/agent/common"
-	
+
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
@@ -31,17 +31,14 @@ type Agent struct {
 	writeMutex         sync.Mutex
 	heartbeatStopChans map[string]chan struct{}
 	heartbeatMutex     sync.Mutex
+	ConfigManager      *common.ConfigManager
 }
 
-func NewAgent() *Agent {
-	// Generate or retrieve the agent ID
-    agentID, err := getOrCreateAgentID()
-    if err != nil {
-        log.Fatalf("Failed to get or create agent ID: %v", err)
-    }
+func NewAgent(configManager *common.ConfigManager) *Agent {
 
     // Connect to the server via WebSocket
-    wsConn, err := ConnectToServer(agentID, SERVER_URL)
+	agentID := configManager.GetAgentID()
+    wsConn, err := ConnectToServer(agentID, configManager.GetProxyServerURL())
     if err != nil {
         log.Fatalf("Failed to connect to server: %v", err)
     }
@@ -49,6 +46,7 @@ func NewAgent() *Agent {
 	return &Agent{
 		wsConn:             wsConn,
 		heartbeatStopChans: make(map[string]chan struct{}),
+		ConfigManager:      configManager,
 	}
 }
 
@@ -71,25 +69,6 @@ func ConnectToServer(agentID string, serverURL string) (*websocket.Conn, error) 
     }
 
     return wsConnTemp, nil
-}
-
-func getOrCreateAgentID() (string, error) {
-    const agentIDFile = "agent_id.txt"
-    if _, err := os.Stat(agentIDFile); err == nil {
-        data, err := os.ReadFile(agentIDFile)
-        if err != nil {
-            return "", err
-        }
-        agentID := strings.TrimSpace(string(data))
-        return agentID, nil
-    }
-
-    agentID := uuid.New().String()
-    err := os.WriteFile(agentIDFile, []byte(agentID), 0600)
-    if err != nil {
-        return "", err
-    }
-    return agentID, nil
 }
 
 // sendControlMessage sends a control message to the server
@@ -386,8 +365,10 @@ func (agent *Agent) reconnectToServer() {
 	for {
 		time.Sleep(5 * time.Second)
 		log.Println("Attempting to reconnect to server...")
-		agentID, _ := getOrCreateAgentID()
-		wsConn, err := ConnectToServer(agentID, uuid.New().String())
+		agentID := agent.ConfigManager.GetAgentID()
+		serverURL := agent.ConfigManager.GetProxyServerURL()
+
+		wsConn, err := ConnectToServer(agentID, serverURL)
 		if err != nil { 
 			log.Printf("Reconnect failed: %v", err)
 			continue
@@ -542,7 +523,7 @@ func handleActivationRequest(w http.ResponseWriter, r *http.Request, requestMana
     log.Println("Received activation request with uuid:", req.UUID, "host:", req.Host, "port:", req.Port)
 
     // Add the Redis server details to the clientManager
-    redisDetails := redisclient.RedisServerDetails{
+    redisDetails := common.RedisServerDetails{
         Host:     req.Host,
         Port:     req.Port,
         Username: req.Username,
@@ -550,12 +531,10 @@ func handleActivationRequest(w http.ResponseWriter, r *http.Request, requestMana
     }
 
     clientManager.AddRedisServerDetails(req.UUID, redisDetails)
-
-    // Save the updated Redis server details to disk
-    err = clientManager.SaveRedisServerDetails(clientManager.RedisServerDetailsMap)
-    if err != nil {
-        log.Println("Error saving Redis server details:", err)
-    }
+	err = agentInstance.ConfigManager.AddServer(req.UUID, redisDetails)
+	if err != nil {
+		log.Println("Error saving agent configuration:", err)
+	}
 
     // Generate a unique request ID
     requestID := uuid.New().String()
@@ -664,9 +643,8 @@ func handleDeactivateRedisServer(controlMsg map[string]interface{}, clientManage
 
 	// Remove the Redis server details from the clientManager
 	clientManager.RemoveRedisServerDetails(redisServerID)
+	err := agent.ConfigManager.RemoveServer(redisServerID)
 
-	// Save the updated Redis server details to disk
-	err := clientManager.SaveRedisServerDetails(clientManager.RedisServerDetailsMap)
 	if err != nil {
 		log.Printf("Error saving Redis server details after deactivation: %v", err)
 	}

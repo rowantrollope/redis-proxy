@@ -1,51 +1,28 @@
 package redisclient
 
 import (
-    "os"
     "log"
     "sync"
-    "encoding/json"
+
+    "github.com/rowantrollope/redis-proxy/agent/common"
 )
 
 type ClientManager struct {
     clients                  map[uint64]*RedisClient
     clientsMutex             sync.Mutex
-    RedisServerDetailsMap    map[string]RedisServerDetails
+    RedisServerDetailsMap    map[string]common.RedisServerDetails
     RedisServerDetailsMutex  sync.Mutex
     clientRedisServerIDMap   map[uint64]string
     clientRedisServerIDMutex sync.Mutex
 }
 
-func NewClientManager() *ClientManager {
-
-    // Load Redis server details
-    redisDetailsMap, err := loadRedisServerDetails()
-    if err != nil {
-        log.Fatalf("Failed to load Redis server details: %v", err)
-    }
-        
+func NewClientManager(config *common.ConfigManager) *ClientManager {
+ 
     return &ClientManager{
         clients:                make(map[uint64]*RedisClient),
-        RedisServerDetailsMap:  redisDetailsMap,
+        RedisServerDetailsMap:  config.GetServers(),
         clientRedisServerIDMap: make(map[uint64]string),
     }
-}
-
-func loadRedisServerDetails() (map[string]RedisServerDetails, error) {
-    const fileName = "redis_servers.json"
-    data, err := os.ReadFile(fileName)
-    if err != nil {
-        if os.IsNotExist(err) {
-            return make(map[string]RedisServerDetails), nil
-        }
-        return nil, err
-    }
-    var detailsMap map[string]RedisServerDetails
-    err = json.Unmarshal(data, &detailsMap)
-    if err != nil {
-        return nil, err
-    }
-    return detailsMap, nil
 }
 
 func (cm *ClientManager) StoreClient(clientID uint64, client *RedisClient) {
@@ -72,16 +49,7 @@ func (cm *ClientManager) AssociateClientWithRedisServerID(clientID uint64, redis
     cm.clientRedisServerIDMap[clientID] = redisServerID
 }
 
-func (cm *ClientManager) SaveRedisServerDetails(detailsMap map[string]RedisServerDetails) error {
-    const fileName = "redis_servers.json"
-    data, err := json.MarshalIndent(detailsMap, "", "  ")
-    if err != nil {
-        return err
-    }
-    return os.WriteFile(fileName, data, 0600)
-}
-
-func (cm *ClientManager) GetRedisServerDetails(redisServerID string) (RedisServerDetails, bool) {
+func (cm *ClientManager) GetRedisServerDetails(redisServerID string) (common.RedisServerDetails, bool) {
     cm.RedisServerDetailsMutex.Lock()
     defer cm.RedisServerDetailsMutex.Unlock()
     details, exists := cm.RedisServerDetailsMap[redisServerID]
@@ -127,7 +95,7 @@ func (cm *ClientManager) DisconnectClientsForRedisServerID(redisServerID string)
 	}
 }
 
-func (cm *ClientManager) AddRedisServerDetails(uuid string, details RedisServerDetails) {
+func (cm *ClientManager) AddRedisServerDetails(uuid string, details common.RedisServerDetails) {
     cm.RedisServerDetailsMutex.Lock()
     defer cm.RedisServerDetailsMutex.Unlock()
     cm.RedisServerDetailsMap[uuid] = details

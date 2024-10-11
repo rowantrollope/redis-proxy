@@ -2,20 +2,27 @@ package main
 
 import (
 	"log"
-    "github.com/rowantrollope/redis-proxy/agent/agent"
+    "github.com/rowantrollope/redis-proxy/agent/core"
     "github.com/rowantrollope/redis-proxy/agent/redisclient"
+    "github.com/rowantrollope/redis-proxy/agent/common"
 )
 
 func main() {
     log.SetFlags(log.LstdFlags | log.Lshortfile)
 
+	configManager, err := common.NewConfigManager()
+	if err != nil {
+		log.Fatalf("Failed to get or create agent config: %v", err)
+	}
+	
+
     // Create an Agent instance
-    agentInstance := agent.NewAgent()
+    agentInstance := agent.NewAgent(configManager)
 
     // Initialize RequestManager
     requestManager := agent.NewRequestManager()
 
-    clientManager := redisclient.NewClientManager()
+    clientManager := redisclient.NewClientManager(configManager)
 
     // Start the HTTP server for activation requests
     go agent.StartHTTPServer(requestManager, clientManager, agentInstance)
